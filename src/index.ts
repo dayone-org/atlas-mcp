@@ -60,11 +60,19 @@ export class MyMCP extends McpAgent {
 	}
 }
 
+function requireApiKey(request: Request, env: Env) {
+	const auth = request.headers.get("Authorization");
+	return auth === `Bearer ${env.MCP_API_KEY}`;
+}
+
 export default {
 	fetch(request: Request, env: Env, ctx: ExecutionContext) {
 		const url = new URL(request.url);
 
 		if (url.pathname === "/mcp") {
+			if (!requireApiKey(request, env)) {
+				return new Response("Unauthorized", { status: 401 });
+			}
 			return MyMCP.serve("/mcp").fetch(request, env, ctx);
 		}
 
