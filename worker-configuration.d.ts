@@ -7,9 +7,6 @@ declare namespace Cloudflare {
 		ASSETS: Fetcher;
 	}
 }
-interface Env extends Cloudflare.Env {
-    MCP_API_KEY: string;
-}
 
 // Begin runtime types
 /*! *****************************************************************************
