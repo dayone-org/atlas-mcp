@@ -18,6 +18,17 @@ npm create cloudflare@latest -- my-mcp-server --template=cloudflare/ai/demos/rem
 
 To add your own [tools](https://developers.cloudflare.com/agents/model-context-protocol/tools/) to the MCP server, define each tool inside the `init()` method of `src/index.ts` using `this.server.tool(...)`.
 
+## Test R2 access
+
+This project binds the `atlas` R2 bucket as `ATLAS_BUCKET`. During local development, the binding is configured with `"remote": true`, so `npm run dev` reads from the real Cloudflare R2 bucket instead of local Miniflare storage.
+
+Available MCP tools:
+
+- `list_r2_files`: list objects in the bucket, with optional `prefix`, `cursor`, and `limit`.
+- `get_r2_file`: fetch an object by `key`; pass `encoding: "base64"` for binary files or leave the default `encoding: "text"` for text files.
+
+The `/mcp` route requires `Authorization: Bearer <MCP_API_KEY>`.
+
 ## Connect to Cloudflare AI Playground
 
 You can connect to your MCP server from the Cloudflare AI Playground, which is a remote MCP client:

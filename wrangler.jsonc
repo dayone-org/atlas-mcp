@@ -9,12 +9,13 @@
 	"compatibility_date": "2025-03-10",
 	"compatibility_flags": ["nodejs_compat"],
 	"observability": {
-		"enabled": true
+		"enabled": true,
 	},
 	"r2_buckets": [
 		{
 			"binding": "ATLAS_BUCKET",
-			"bucket_name": "atlas"
-		}
-	]
+			"bucket_name": "atlas",
+			"remote": true,
+		},
+	],
 }
