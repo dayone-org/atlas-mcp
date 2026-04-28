@@ -14,8 +14,9 @@
 	"r2_buckets": [
 		{
 			"binding": "ATLAS_BUCKET",
-			"bucket_name": "atlas",
+			"bucket_name": "atlas-bucket",
 			"remote": true,
+			"jurisdiction": "eu"
 		},
 	],
 }

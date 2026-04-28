@@ -16,16 +16,21 @@ npm create cloudflare@latest -- my-mcp-server --template=cloudflare/ai/demos/rem
 
 ## Customizing your MCP Server
 
-To add your own [tools](https://developers.cloudflare.com/agents/model-context-protocol/tools/) to the MCP server, define each tool inside the `init()` method of `src/index.ts` using `this.server.tool(...)`.
+To add your own [tools](https://developers.cloudflare.com/agents/model-context-protocol/tools/) to the MCP server, register them in `createServer()` inside `src/index.ts`.
 
-## Test R2 access
+## Atlas workspace tools
 
 This project binds the `atlas` R2 bucket as `ATLAS_BUCKET`. During local development, the binding is configured with `"remote": true`, so `npm run dev` reads from the real Cloudflare R2 bucket instead of local Miniflare storage.
 
 Available MCP tools:
 
-- `list_r2_files`: list objects in the bucket, with optional `prefix`, `cursor`, and `limit`.
-- `get_r2_file`: fetch an object by `key`; pass `encoding: "base64"` for binary files or leave the default `encoding: "text"` for text files.
+- `list`: list files and directories under a workspace-relative path.
+- `read`: read a UTF-8 text file.
+- `mkdir`: create a logical directory marker in R2.
+- `rmdir`: remove a logical directory; pass `recursive: true` to delete everything under it.
+- `apply_patch`: add, update, or delete text files with a patch.
+
+Paths are normalized as Atlas workspace paths: leading `/` is allowed, `..` is rejected, and R2 directory markers are hidden from `list`.
 
 The `/mcp` route requires `Authorization: Bearer <MCP_API_KEY>`.
 
