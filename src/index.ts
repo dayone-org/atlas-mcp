@@ -1,69 +1,33 @@
+import { createMcpHandler } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { McpAgent } from "agents/mcp";
 import { z } from "zod";
 
-declare global {
-	interface Env extends Cloudflare.Env {
-		MCP_API_KEY: string;
-	}
-}
-
-// Define our MCP agent with tools
-export class MyMCP extends McpAgent {
-	server = new McpServer({
-		name: "Calculator",
+function createServer(env: Env) {
+	const server = new McpServer({
+		name: "Atlas MCP",
 		version: "1.0.0",
 	});
 
-	async init() {
-		// Simple addition tool
-		this.server.registerTool(
-			"add",
-			{ inputSchema: { a: z.number(), b: z.number() } },
-			async ({ a, b }) => ({
+	server.registerTool(
+		"add",
+		{
+			description: "Add two numbers",
+			inputSchema: {
+				a: z.number(),
+				b: z.number(),
+			},
+		},
+		async ({ a, b }) => {
+			// read files in ATLAS_BUCKET
+			const files = await env.ATLAS_BUCKET.list();
+			console.log("Files in ATLAS_BUCKET", files);
+			return {
 				content: [{ type: "text", text: String(a + b) }],
-			}),
-		);
+			};
+		},
+	);
 
-		// Calculator tool with multiple operations
-		this.server.registerTool(
-			"calculate",
-			{
-				inputSchema: {
-					operation: z.enum(["add", "subtract", "multiply", "divide"]),
-					a: z.number(),
-					b: z.number(),
-				},
-			},
-			async ({ operation, a, b }) => {
-				let result: number;
-				switch (operation) {
-					case "add":
-						result = a + b;
-						break;
-					case "subtract":
-						result = a - b;
-						break;
-					case "multiply":
-						result = a * b;
-						break;
-					case "divide":
-						if (b === 0)
-							return {
-								content: [
-									{
-										type: "text",
-										text: "Error: Cannot divide by zero",
-									},
-								],
-							};
-						result = a / b;
-						break;
-				}
-				return { content: [{ type: "text", text: String(result) }] };
-			},
-		);
-	}
+	return server;
 }
 
 function requireApiKey(request: Request, env: Env) {
@@ -79,9 +43,10 @@ export default {
 			if (!requireApiKey(request, env)) {
 				return new Response("Unauthorized", { status: 401 });
 			}
-			return MyMCP.serve("/mcp").fetch(request, env, ctx);
+			const server = createServer(env);
+			return createMcpHandler(server)(request, env, ctx);
 		}
 
 		return new Response("Not found", { status: 404 });
 	},
-};
+} satisfies ExportedHandler<Env>;
