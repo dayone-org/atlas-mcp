@@ -8,19 +8,19 @@ const DELETE_BATCH_SIZE = 1000;
 
 type PatchOperation =
 	| {
-			kind: "add";
-			path: string;
-			content: string;
-		}
+		kind: "add";
+		path: string;
+		content: string;
+	}
 	| {
-			kind: "update";
-			path: string;
-			hunks: PatchHunk[];
-		}
+		kind: "update";
+		path: string;
+		hunks: PatchHunk[];
+	}
 	| {
-			kind: "delete";
-			path: string;
-		};
+		kind: "delete";
+		path: string;
+	};
 
 type PatchHunk = {
 	lines: PatchHunkLine[];
@@ -500,6 +500,10 @@ function createServer(env: Env) {
 	const server = new McpServer({
 		name: "Atlas MCP",
 		version: "1.0.0",
+		icons: [{
+			src: "/atlas.svg",
+			mimeType: "image/svg+xml",
+		}]
 	});
 
 	server.registerTool(
