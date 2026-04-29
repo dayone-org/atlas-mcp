@@ -11,6 +11,9 @@
 	"observability": {
 		"enabled": true,
 	},
+	"assets": {
+		"directory": "./public",
+	},
 	"r2_buckets": [
 		{
 			"binding": "ATLAS_BUCKET",

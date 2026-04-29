@@ -496,13 +496,14 @@ async function applyTextPatch(bucket: R2Bucket, input: string) {
 	};
 }
 
-function createServer(env: Env) {
+function createServer(env: Env, origin: string) {
 	const server = new McpServer({
 		name: "Atlas MCP",
 		version: "1.0.0",
 		icons: [{
-			src: "/atlas.svg",
+			src: `${origin}/atlas.svg`,
 			mimeType: "image/svg+xml",
+			sizes: ["any"],
 		}]
 	});
 
@@ -651,7 +652,7 @@ export default {
 			if (!requireApiKey(request, env)) {
 				return new Response("Unauthorized", { status: 401 });
 			}
-			const server = createServer(env);
+			const server = createServer(env, url.origin);
 			return createMcpHandler(server)(request, env, ctx);
 		}
 
