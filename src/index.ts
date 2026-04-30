@@ -4,6 +4,7 @@ import { z } from "zod";
 
 const DIRECTORY_MARKER_NAME = ".atlas-directory";
 const MAX_TEXT_FILE_BYTES = 1024 * 1024;
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const DELETE_BATCH_SIZE = 1000;
 
 type PatchOperation =
@@ -155,6 +156,99 @@ function contentTypeForPath(path: string) {
 	return "text/plain; charset=utf-8";
 }
 
+function contentTypeForUploadPath(path: string) {
+	const lower = path.toLowerCase();
+
+	if (lower.endsWith(".md")) {
+		return "text/markdown; charset=utf-8";
+	}
+
+	if (lower.endsWith(".txt")) {
+		return "text/plain; charset=utf-8";
+	}
+
+	if (lower.endsWith(".json")) {
+		return "application/json; charset=utf-8";
+	}
+
+	if (lower.endsWith(".csv")) {
+		return "text/csv; charset=utf-8";
+	}
+
+	if (lower.endsWith(".pdf")) {
+		return "application/pdf";
+	}
+
+	if (lower.endsWith(".docx")) {
+		return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+	}
+
+	if (lower.endsWith(".pptx")) {
+		return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+	}
+
+	if (lower.endsWith(".xlsx")) {
+		return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+	}
+
+	if (lower.endsWith(".png")) {
+		return "image/png";
+	}
+
+	if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+		return "image/jpeg";
+	}
+
+	if (lower.endsWith(".svg")) {
+		return "image/svg+xml";
+	}
+
+	return "application/octet-stream";
+}
+
+function parseBase64Content(input: string) {
+	const dataUrlMatch = /^data:([^;,]+)?;base64,(.*)$/s.exec(input);
+	const contentType = dataUrlMatch?.[1];
+	const rawBase64 = dataUrlMatch ? dataUrlMatch[2] : input;
+	const normalized = rawBase64
+		.replace(/\s/g, "")
+		.replace(/-/g, "+")
+		.replace(/_/g, "/");
+	const padded = normalized.padEnd(normalized.length + (4 - normalized.length % 4) % 4, "=");
+
+	if (!/^[A-Za-z0-9+/]*={0,2}$/.test(padded)) {
+		throw new Error("Upload content must be valid base64.");
+	}
+
+	const paddingBytes = padded.endsWith("==") ? 2 : padded.endsWith("=") ? 1 : 0;
+	const decodedBytes = Math.floor(padded.length * 3 / 4) - paddingBytes;
+
+	if (decodedBytes > MAX_UPLOAD_BYTES) {
+		throw new Error(`Upload is too large (${decodedBytes} bytes).`);
+	}
+
+	const binary = atob(padded);
+	const bytes = new Uint8Array(binary.length);
+
+	for (let index = 0; index < binary.length; index++) {
+		bytes[index] = binary.charCodeAt(index);
+	}
+
+	return {
+		bytes,
+		contentType,
+	};
+}
+
+function toHex(bytes: Uint8Array) {
+	return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function sha256Hex(bytes: Uint8Array) {
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return toHex(new Uint8Array(digest));
+}
+
 async function readTextObject(bucket: R2Bucket, key: string) {
 	const object = await bucket.get(key);
 
@@ -167,6 +261,40 @@ async function readTextObject(bucket: R2Bucket, key: string) {
 	}
 
 	return object.text();
+}
+
+async function uploadObject(
+	bucket: R2Bucket,
+	path: string,
+	contentBase64: string,
+	contentType: string | undefined,
+	overwrite: boolean,
+) {
+	const key = normalizeFilePath(path);
+
+	if (!overwrite && await bucket.head(key)) {
+		throw new Error(`${key} already exists. Pass overwrite: true to replace it.`);
+	}
+
+	const parsed = parseBase64Content(contentBase64);
+	const sha256 = await sha256Hex(parsed.bytes);
+	const object = await bucket.put(key, parsed.bytes, {
+		httpMetadata: {
+			contentType: contentType ?? parsed.contentType ?? contentTypeForUploadPath(key),
+		},
+		customMetadata: {
+			sha256,
+		},
+	});
+
+	return {
+		ok: true,
+		path: key,
+		size: object.size,
+		etag: object.etag,
+		sha256,
+		overwritten: overwrite,
+	};
 }
 
 async function listKeysWithPrefix(bucket: R2Bucket, prefix: string) {
@@ -579,6 +707,24 @@ function createServer(env: Env, origin: string) {
 			return {
 				content: [{ type: "text", text: content }],
 			};
+		},
+	);
+
+	server.registerTool(
+		"upload",
+		{
+			description: "Upload any file to the Atlas workspace using base64 content.",
+			inputSchema: {
+				path: z.string().min(1),
+				contentBase64: z.string(),
+				contentType: z.string().optional(),
+				overwrite: z.boolean().default(false),
+			},
+		},
+		async ({ path, contentBase64, contentType, overwrite }) => {
+			return jsonContent(
+				await uploadObject(env.ATLAS_BUCKET, path, contentBase64, contentType, overwrite),
+			);
 		},
 	);
 

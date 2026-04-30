@@ -26,6 +26,7 @@ Available MCP tools:
 
 - `list`: list files and directories under a workspace-relative path.
 - `read`: read a UTF-8 text file.
+- `upload`: upload any file using base64 content.
 - `mkdir`: create a logical directory marker in R2.
 - `rmdir`: remove a logical directory; pass `recursive: true` to delete everything under it.
 - `apply_patch`: add, update, or delete text files with a patch.

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Atlas"
+  short_description: "Work with Atlas knowledge workspaces"
+  default_prompt: "Use $atlas to work with an Atlas workspace. Route the request to ingest, query, or lint behavior based on user intent, then follow the Atlas runtime schema for project resolution, knowledge pages, `_atlas.md`, `_client.md`, `_project.md`, `_index.md`, `_log.md`, `sources/`, and `knowledge/`."
