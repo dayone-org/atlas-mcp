@@ -26,14 +26,19 @@ Available MCP tools:
 
 - `list`: list files and directories under a workspace-relative path.
 - `read`: read a UTF-8 text file.
-- `upload`: upload any file using base64 content.
 - `mkdir`: create a logical directory marker in R2.
 - `rmdir`: remove a logical directory; pass `recursive: true` to delete everything under it.
 - `apply_patch`: add, update, or delete text files with a patch.
 
 Paths are normalized as Atlas workspace paths: leading `/` is allowed, `..` is rejected, and R2 directory markers are hidden from `list`.
 
-The `/mcp` route requires `Authorization: Bearer <MCP_API_KEY>`.
+Raw source artifacts are uploaded outside MCP with `PUT /files/<atlas-path>`. The request body is the file bytes, `Content-Length` is required, and uploads fail with `409` when the target exists unless `?overwrite=true` is passed. Optional metadata headers:
+
+- `Content-Type`: stored as R2 HTTP metadata; defaults from the Atlas path when omitted.
+- `X-Atlas-Sha256`: SHA-256 hex digest stored as custom metadata.
+- `X-Atlas-Source-Filename`: original local filename stored as custom metadata.
+
+The `/mcp` and `/files/<atlas-path>` routes require `Authorization: Bearer <MCP_API_KEY>`.
 
 ## Connect to Cloudflare AI Playground
 

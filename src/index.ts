@@ -9,19 +9,19 @@ const DELETE_BATCH_SIZE = 1000;
 
 type PatchOperation =
 	| {
-		kind: "add";
-		path: string;
-		content: string;
-	}
+			kind: "add";
+			path: string;
+			content: string;
+	  }
 	| {
-		kind: "update";
-		path: string;
-		hunks: PatchHunk[];
-	}
+			kind: "update";
+			path: string;
+			hunks: PatchHunk[];
+	  }
 	| {
-		kind: "delete";
-		path: string;
-	};
+			kind: "delete";
+			path: string;
+	  };
 
 type PatchHunk = {
 	lines: PatchHunkLine[];
@@ -49,6 +49,22 @@ function jsonContent(value: unknown) {
 			},
 		],
 	};
+}
+
+function jsonResponse(value: unknown, init: ResponseInit = {}) {
+	const headers = new Headers(init.headers);
+	headers.set("content-type", "application/json; charset=utf-8");
+
+	return new Response(JSON.stringify(value, null, 2), {
+		...init,
+		headers,
+	});
+}
+
+function errorResponse(error: unknown, status = 400) {
+	const message = error instanceof Error ? error.message : String(error);
+
+	return jsonResponse({ ok: false, error: message }, { status });
 }
 
 function hasControlCharacter(value: string) {
@@ -206,47 +222,104 @@ function contentTypeForUploadPath(path: string) {
 	return "application/octet-stream";
 }
 
-function parseBase64Content(input: string) {
-	const dataUrlMatch = /^data:([^;,]+)?;base64,(.*)$/s.exec(input);
-	const contentType = dataUrlMatch?.[1];
-	const rawBase64 = dataUrlMatch ? dataUrlMatch[2] : input;
-	const normalized = rawBase64
-		.replace(/\s/g, "")
-		.replace(/-/g, "+")
-		.replace(/_/g, "/");
-	const padded = normalized.padEnd(normalized.length + (4 - normalized.length % 4) % 4, "=");
+function parseOverwriteParam(url: URL) {
+	const value = url.searchParams.get("overwrite");
 
-	if (!/^[A-Za-z0-9+/]*={0,2}$/.test(padded)) {
-		throw new Error("Upload content must be valid base64.");
+	if (value === null || value === "" || value === "false" || value === "0") {
+		return false;
 	}
 
-	const paddingBytes = padded.endsWith("==") ? 2 : padded.endsWith("=") ? 1 : 0;
-	const decodedBytes = Math.floor(padded.length * 3 / 4) - paddingBytes;
-
-	if (decodedBytes > MAX_UPLOAD_BYTES) {
-		throw new Error(`Upload is too large (${decodedBytes} bytes).`);
+	if (value === "true" || value === "1") {
+		return true;
 	}
 
-	const binary = atob(padded);
-	const bytes = new Uint8Array(binary.length);
-
-	for (let index = 0; index < binary.length; index++) {
-		bytes[index] = binary.charCodeAt(index);
-	}
-
-	return {
-		bytes,
-		contentType,
-	};
+	throw new Error("overwrite must be true or false.");
 }
 
-function toHex(bytes: Uint8Array) {
-	return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+function parseContentLength(request: Request) {
+	const value = request.headers.get("content-length");
+
+	if (value === null) {
+		throw new Error("Content-Length is required for file uploads.");
+	}
+
+	if (!/^\d+$/.test(value)) {
+		throw new Error("Content-Length must be a non-negative integer.");
+	}
+
+	const size = Number(value);
+
+	if (!Number.isSafeInteger(size)) {
+		throw new Error("Content-Length is too large.");
+	}
+
+	if (size > MAX_UPLOAD_BYTES) {
+		throw new Error(`Upload is too large (${size} bytes).`);
+	}
+
+	return size;
 }
 
-async function sha256Hex(bytes: Uint8Array) {
-	const digest = await crypto.subtle.digest("SHA-256", bytes);
-	return toHex(new Uint8Array(digest));
+function normalizeFilesRoutePath(url: URL) {
+	const prefix = "/files/";
+
+	if (!url.pathname.startsWith(prefix)) {
+		throw new Error("File upload path must start with /files/.");
+	}
+
+	const rawPath = url.pathname.slice(prefix.length);
+
+	if (rawPath === "") {
+		throw new Error("File upload path is required.");
+	}
+
+	try {
+		return normalizeFilePath(decodeURIComponent(rawPath));
+	} catch (error) {
+		if (error instanceof URIError) {
+			const pathError = new Error("File upload path contains invalid percent encoding.");
+			(pathError as Error & { cause: unknown }).cause = error;
+			throw pathError;
+		}
+
+		throw error;
+	}
+}
+
+function normalizeSha256Header(request: Request) {
+	const value = request.headers.get("x-atlas-sha256");
+
+	if (value === null || value.trim() === "") {
+		return undefined;
+	}
+
+	const normalized = value.trim().toLowerCase();
+
+	if (!/^[a-f0-9]{64}$/.test(normalized)) {
+		throw new Error("X-Atlas-Sha256 must be a lowercase or uppercase SHA-256 hex digest.");
+	}
+
+	return normalized;
+}
+
+function normalizeOptionalMetadataHeader(request: Request, headerName: string, label: string) {
+	const value = request.headers.get(headerName);
+
+	if (value === null || value.trim() === "") {
+		return undefined;
+	}
+
+	const normalized = value.trim();
+
+	if (hasControlCharacter(normalized)) {
+		throw new Error(`${label} must not contain control characters.`);
+	}
+
+	if (normalized.length > 512) {
+		throw new Error(`${label} is too long.`);
+	}
+
+	return normalized;
 }
 
 async function readTextObject(bucket: R2Bucket, key: string) {
@@ -261,40 +334,6 @@ async function readTextObject(bucket: R2Bucket, key: string) {
 	}
 
 	return object.text();
-}
-
-async function uploadObject(
-	bucket: R2Bucket,
-	path: string,
-	contentBase64: string,
-	contentType: string | undefined,
-	overwrite: boolean,
-) {
-	const key = normalizeFilePath(path);
-
-	if (!overwrite && await bucket.head(key)) {
-		throw new Error(`${key} already exists. Pass overwrite: true to replace it.`);
-	}
-
-	const parsed = parseBase64Content(contentBase64);
-	const sha256 = await sha256Hex(parsed.bytes);
-	const object = await bucket.put(key, parsed.bytes, {
-		httpMetadata: {
-			contentType: contentType ?? parsed.contentType ?? contentTypeForUploadPath(key),
-		},
-		customMetadata: {
-			sha256,
-		},
-	});
-
-	return {
-		ok: true,
-		path: key,
-		size: object.size,
-		etag: object.etag,
-		sha256,
-		overwritten: overwrite,
-	};
 }
 
 async function listKeysWithPrefix(bucket: R2Bucket, prefix: string) {
@@ -358,11 +397,57 @@ async function removeDirectory(bucket: R2Bucket, path: string, recursive: boolea
 	};
 }
 
+async function uploadFileRequest(request: Request, env: Env, url: URL) {
+	const key = normalizeFilesRoutePath(url);
+	const overwrite = parseOverwriteParam(url);
+	const size = parseContentLength(request);
+	const sha256 = normalizeSha256Header(request);
+	const sourceFilename = normalizeOptionalMetadataHeader(
+		request,
+		"x-atlas-source-filename",
+		"X-Atlas-Source-Filename",
+	);
+	const body = request.body;
+
+	if (body === null) {
+		throw new Error("Upload request body is required.");
+	}
+
+	if (!overwrite && (await env.ATLAS_BUCKET.head(key))) {
+		return errorResponse(`${key} already exists. Add ?overwrite=true to replace it.`, 409);
+	}
+
+	const contentType = request.headers.get("content-type") || contentTypeForUploadPath(key);
+	const object = await env.ATLAS_BUCKET.put(key, body, {
+		httpMetadata: {
+			contentType,
+		},
+		customMetadata: {
+			...(sha256 ? { sha256 } : {}),
+			...(sourceFilename ? { sourceFilename } : {}),
+		},
+	});
+
+	return jsonResponse({
+		ok: true,
+		path: key,
+		size: object.size,
+		etag: object.etag,
+		sha256: sha256 ?? null,
+		sourceFilename: sourceFilename ?? null,
+		overwritten: overwrite,
+		contentType,
+		contentLength: size,
+	});
+}
+
 function isPatchDirective(line: string) {
-	return line === "*** End Patch" ||
+	return (
+		line === "*** End Patch" ||
 		line.startsWith("*** Add File: ") ||
 		line.startsWith("*** Update File: ") ||
-		line.startsWith("*** Delete File: ");
+		line.startsWith("*** Delete File: ")
+	);
 }
 
 function parsePatch(input: string): PatchOperation[] {
@@ -419,7 +504,8 @@ function parsePatch(input: string): PatchOperation[] {
 			operations.push({
 				kind: "add",
 				path,
-				content: addLines.length === 0 ? "" : addLines.join("\n") + (finalNewline ? "\n" : ""),
+				content:
+					addLines.length === 0 ? "" : addLines.join("\n") + (finalNewline ? "\n" : ""),
 			});
 			continue;
 		}
@@ -444,7 +530,10 @@ function parsePatch(input: string): PatchOperation[] {
 				) {
 					const hunkLine = lines[index];
 
-					if (hunkLine === "\\ No newline at end of file" || hunkLine === "*** End of File") {
+					if (
+						hunkLine === "\\ No newline at end of file" ||
+						hunkLine === "*** End of File"
+					) {
 						index++;
 						continue;
 					}
@@ -628,11 +717,13 @@ function createServer(env: Env, origin: string) {
 	const server = new McpServer({
 		name: "Atlas MCP",
 		version: "1.0.0",
-		icons: [{
-			src: `${origin}/atlas.svg`,
-			mimeType: "image/svg+xml",
-			sizes: ["any"],
-		}]
+		icons: [
+			{
+				src: `${origin}/atlas.svg`,
+				mimeType: "image/svg+xml",
+				sizes: ["any"],
+			},
+		],
 	});
 
 	server.registerTool(
@@ -680,7 +771,7 @@ function createServer(env: Env, origin: string) {
 			return jsonContent({
 				path: directory,
 				entries: [...directories, ...files].sort((left, right) =>
-					left.name.localeCompare(right.name)
+					left.name.localeCompare(right.name),
 				),
 				truncated: result.truncated,
 				cursor: result.truncated ? result.cursor : null,
@@ -707,24 +798,6 @@ function createServer(env: Env, origin: string) {
 			return {
 				content: [{ type: "text", text: content }],
 			};
-		},
-	);
-
-	server.registerTool(
-		"upload",
-		{
-			description: "Upload any file to the Atlas workspace using base64 content.",
-			inputSchema: {
-				path: z.string().min(1),
-				contentBase64: z.string(),
-				contentType: z.string().optional(),
-				overwrite: z.boolean().default(false),
-			},
-		},
-		async ({ path, contentBase64, contentType, overwrite }) => {
-			return jsonContent(
-				await uploadObject(env.ATLAS_BUCKET, path, contentBase64, contentType, overwrite),
-			);
 		},
 	);
 
@@ -800,6 +873,23 @@ export default {
 			}
 			const server = createServer(env, url.origin);
 			return createMcpHandler(server)(request, env, ctx);
+		}
+
+		if (url.pathname.startsWith("/files/")) {
+			if (!requireApiKey(request, env)) {
+				return new Response("Unauthorized", { status: 401 });
+			}
+
+			if (request.method !== "PUT") {
+				return new Response("Method not allowed", {
+					status: 405,
+					headers: {
+						allow: "PUT",
+					},
+				});
+			}
+
+			return uploadFileRequest(request, env, url).catch((error) => errorResponse(error));
 		}
 
 		return new Response("Not found", { status: 404 });
