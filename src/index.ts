@@ -6,6 +6,7 @@ const DIRECTORY_MARKER_NAME = ".atlas-directory";
 const MAX_TEXT_FILE_BYTES = 1024 * 1024;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
 const DELETE_BATCH_SIZE = 1000;
+const PROJECT_CORE_FILE_NAMES = ["_project.md", "_state.md", "_index.md", "_log.md"] as const;
 
 type PatchOperation =
 	| {
@@ -61,8 +62,12 @@ function jsonResponse(value: unknown, init: ResponseInit = {}) {
 	});
 }
 
+function errorMessage(error: unknown) {
+	return error instanceof Error ? error.message : String(error);
+}
+
 function errorResponse(error: unknown, status = 400) {
-	const message = error instanceof Error ? error.message : String(error);
+	const message = errorMessage(error);
 
 	return jsonResponse({ ok: false, error: message }, { status });
 }
@@ -334,6 +339,130 @@ async function readTextObject(bucket: R2Bucket, key: string) {
 	}
 
 	return object.text();
+}
+
+async function readTextFileResult(bucket: R2Bucket, path: string) {
+	let key: string;
+
+	try {
+		key = normalizeFilePath(path);
+	} catch (error) {
+		return {
+			ok: false as const,
+			path,
+			error: errorMessage(error),
+		};
+	}
+
+	try {
+		const content = await readTextObject(bucket, key);
+
+		if (content === undefined) {
+			return {
+				ok: false as const,
+				path: key,
+				error: `${key} does not exist.`,
+			};
+		}
+
+		return {
+			ok: true as const,
+			path: key,
+			content,
+		};
+	} catch (error) {
+		return {
+			ok: false as const,
+			path: key,
+			error: errorMessage(error),
+		};
+	}
+}
+
+async function readOptionalProjectCoreFile(
+	bucket: R2Bucket,
+	projectPath: string,
+	name: (typeof PROJECT_CORE_FILE_NAMES)[number],
+) {
+	const path = `${projectPath}/${name}`;
+
+	try {
+		const content = await readTextObject(bucket, path);
+
+		if (content === undefined) {
+			return undefined;
+		}
+
+		return {
+			ok: true as const,
+			name,
+			path,
+			content,
+		};
+	} catch (error) {
+		return {
+			ok: false as const,
+			name,
+			path,
+			error: errorMessage(error),
+		};
+	}
+}
+
+async function listShallowDirectory(bucket: R2Bucket, path: string) {
+	const directory = normalizeDirectoryPath(path);
+	const prefix = `${directory}/`;
+	const directories = new Map<string, { type: "directory"; name: string; path: string }>();
+	const files = new Map<
+		string,
+		{ type: "file"; name: string; path: string; size: number; uploaded: string }
+	>();
+	let exists = false;
+	let cursor: string | undefined;
+
+	do {
+		const result = await bucket.list({
+			prefix,
+			cursor,
+			limit: 1000,
+			delimiter: "/",
+		});
+
+		exists = exists || result.objects.length > 0 || result.delimitedPrefixes.length > 0;
+
+		for (const delimitedPrefix of result.delimitedPrefixes) {
+			const entryPath = delimitedPrefix.replace(/\/$/, "");
+			directories.set(entryPath, {
+				type: "directory",
+				name: basename(entryPath),
+				path: entryPath,
+			});
+		}
+
+		for (const object of result.objects) {
+			if (isDirectoryMarkerKey(object.key)) {
+				continue;
+			}
+
+			files.set(object.key, {
+				type: "file",
+				name: basename(object.key),
+				path: object.key,
+				size: object.size,
+				uploaded: object.uploaded.toISOString(),
+			});
+		}
+
+		cursor = result.truncated ? result.cursor : undefined;
+	} while (cursor);
+
+	return {
+		path: directory,
+		exists,
+		entries: [...directories.values(), ...files.values()].sort((left, right) =>
+			left.name.localeCompare(right.name),
+		),
+	};
 }
 
 async function listKeysWithPrefix(bucket: R2Bucket, prefix: string) {
@@ -798,6 +927,58 @@ function createServer(env: Env, origin: string) {
 			return {
 				content: [{ type: "text", text: content }],
 			};
+		},
+	);
+
+	server.registerTool(
+		"read_many",
+		{
+			description: "Read multiple UTF-8 text files from the Atlas workspace in one call.",
+			inputSchema: {
+				paths: z.array(z.string()).min(1).max(50),
+			},
+		},
+		async ({ paths }) => {
+			const results = await Promise.all(
+				paths.map((path) => readTextFileResult(env.ATLAS_BUCKET, path)),
+			);
+
+			return jsonContent({
+				ok: true,
+				results,
+			});
+		},
+	);
+
+	server.registerTool(
+		"project_context",
+		{
+			description:
+				"Read core Atlas project files and shallow knowledge/source catalogs for a project.",
+			inputSchema: {
+				path: z.string().min(1),
+			},
+		},
+		async ({ path }) => {
+			const projectPath = normalizeDirectoryPath(path);
+			const [coreFileResults, knowledge, sources] = await Promise.all([
+				Promise.all(
+					PROJECT_CORE_FILE_NAMES.map((name) =>
+						readOptionalProjectCoreFile(env.ATLAS_BUCKET, projectPath, name),
+					),
+				),
+				listShallowDirectory(env.ATLAS_BUCKET, `${projectPath}/knowledge`),
+				listShallowDirectory(env.ATLAS_BUCKET, `${projectPath}/sources`),
+			]);
+			const coreFiles = coreFileResults.filter((result) => result !== undefined);
+
+			return jsonContent({
+				ok: true,
+				path: projectPath,
+				coreFiles,
+				knowledge,
+				sources,
+			});
 		},
 	);
 

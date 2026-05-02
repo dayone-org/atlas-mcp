@@ -26,11 +26,29 @@ Available MCP tools:
 
 - `list`: list files and directories under a workspace-relative path.
 - `read`: read a UTF-8 text file.
+- `read_many`: read up to 50 UTF-8 text files in one call. Returns ordered
+  per-file results, with missing, unsafe, or oversized files reported as
+  item-level errors.
+- `project_context`: hydrate an Atlas project in one call. Reads present core files
+  (`_project.md`, `_state.md`, `_index.md`, `_log.md`) and returns shallow
+  `knowledge/` and `sources/` catalogs.
 - `mkdir`: create a logical directory marker in R2.
 - `rmdir`: remove a logical directory; pass `recursive: true` to delete everything under it.
 - `apply_patch`: add, update, or delete text files with a patch.
 
 Paths are normalized as Atlas workspace paths: leading `/` is allowed, `..` is rejected, and R2 directory markers are hidden from `list`.
+
+Use `read_many` when an agent already knows the exact files it needs:
+
+```json
+{ "paths": ["clients/acme/projects/website-refresh/_project.md", "clients/acme/projects/website-refresh/_state.md"] }
+```
+
+Use `project_context` as the first hydration call for a project:
+
+```json
+{ "path": "clients/acme/projects/website-refresh" }
+```
 
 Raw source artifacts are uploaded outside MCP with `PUT /files/<atlas-path>`. The request body is the file bytes, `Content-Length` is required, and uploads fail with `409` when the target exists unless `?overwrite=true` is passed. Optional metadata headers:
 
