@@ -171,6 +171,10 @@ dist
 .dev.vars
 .wrangler/
 
+# local Atlas/qmd state
+.atlas/
+.tmp/
+
 # skills
 .agents/
 .claude/

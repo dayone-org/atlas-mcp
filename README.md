@@ -1,91 +1,196 @@
-# Building a Remote MCP Server on Cloudflare (Without Auth)
+# Atlas MCP
 
-This example allows you to deploy a remote MCP server that doesn't require authentication on Cloudflare Workers.
+Local-first MCP server for testing Atlas company-brain orchestration.
 
-## Get started:
+The current development path is intentionally local:
 
-[![Deploy to Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/cloudflare/ai/tree/main/demos/remote-mcp-authless)
+- markdown files on local disk are canonical memory
+- qmd provides the local retrieval index
+- Atlas parses frontmatter for object metadata, graph edges, evidence, and metacognition
+- Atlas MCP serves the canonical Atlas workflow docs as MCP resources and prompts
+- no Cloudflare Workers or R2 are required for behavior testing
 
-This will deploy your MCP server to a URL like: `remote-mcp-server-authless.<your-account>.workers.dev/mcp`
+The old Worker/R2 implementation is still present in `src/index.ts` for later deployment work, but `npm run dev` now starts the local Node server.
 
-Alternatively, you can use the command line below to get the remote MCP Server created on your local machine:
+## Requirements
+
+- Node.js 22 or newer
+- npm
+- local markdown workspace
+
+`@tobilu/qmd` stores its SQLite index locally and can optionally download local GGUF models when vector embeddings or hybrid query expansion are used. The default Atlas search mode is lexical BM25, so the first local path does not require model downloads.
+
+## Run Locally
+
+From `atlas-mcp`:
 
 ```bash
-npm create cloudflare@latest -- my-mcp-server --template=cloudflare/ai/demos/remote-mcp-authless
+npm install
+npm run dev
 ```
 
-## Customizing your MCP Server
+By default, local scripts use the repo-level canonical workspace:
 
-To add your own [tools](https://developers.cloudflare.com/agents/model-context-protocol/tools/) to the MCP server, register them in `createServer()` inside `src/index.ts`.
-
-## Atlas workspace tools
-
-This project binds the `atlas` R2 bucket as `ATLAS_BUCKET`. During local development, the binding is configured with `"remote": true`, so `npm run dev` reads from the real Cloudflare R2 bucket instead of local Miniflare storage.
-
-Available MCP tools:
-
-- `list`: list files and directories under a workspace-relative path.
-- `read`: read a UTF-8 text file.
-- `read_many`: read up to 50 UTF-8 text files in one call. Returns ordered
-  per-file results, with missing, unsafe, or oversized files reported as
-  item-level errors.
-- `project_context`: hydrate an Atlas project in one call. Reads present core files
-  (`_project.md`, `_state.md`, `_index.md`, `_log.md`) and returns shallow
-  `knowledge/` and `sources/` catalogs.
-- `mkdir`: create a logical directory marker in R2.
-- `rmdir`: remove a logical directory; pass `recursive: true` to delete everything under it.
-- `apply_patch`: add, update, or delete text files with a patch.
-
-Paths are normalized as Atlas workspace paths: leading `/` is allowed, `..` is rejected, and R2 directory markers are hidden from `list`.
-
-Use `read_many` when an agent already knows the exact files it needs:
-
-```json
-{ "paths": ["clients/acme/projects/website-refresh/_project.md", "clients/acme/projects/website-refresh/_state.md"] }
+```text
+/Users/Bean.Duong/Desktop/dev/atlas/atlas-data
 ```
 
-Use `project_context` as the first hydration call for a project:
+Override it when needed:
 
-```json
-{ "path": "clients/acme/projects/website-refresh" }
+```bash
+ATLAS_WORKSPACE=/path/to/atlas-workspace npm run dev
 ```
 
-Raw source artifacts are uploaded outside MCP with `PUT /files/<atlas-path>`. The request body is the file bytes, `Content-Length` is required, and uploads fail with `409` when the target exists unless `?overwrite=true` is passed. Optional metadata headers:
+The server starts at:
 
-- `Content-Type`: stored as R2 HTTP metadata; defaults from the Atlas path when omitted.
-- `X-Atlas-Sha256`: SHA-256 hex digest stored as custom metadata.
-- `X-Atlas-Source-Filename`: original local filename stored as custom metadata.
+```text
+http://localhost:8787/mcp
+```
 
-The `/mcp` and `/files/<atlas-path>` routes require `Authorization: Bearer <MCP_API_KEY>`.
+If `ATLAS_WORKSPACE` is omitted when using the npm scripts, `../atlas-data` is used.
+If you run `src/local/server.ts` directly without `--workspace` or `ATLAS_WORKSPACE`,
+the current working directory is used.
 
-## Connect to Cloudflare AI Playground
+Generated local state is stored under:
 
-You can connect to your MCP server from the Cloudflare AI Playground, which is a remote MCP client:
+```text
+$ATLAS_WORKSPACE/.atlas/qmd.sqlite
+```
 
-1. Go to https://playground.ai.cloudflare.com/
-2. Enter your deployed MCP server URL (`remote-mcp-server-authless.<your-account>.workers.dev/mcp`)
-3. You can now use your MCP tools directly from the playground!
+You can override it:
 
-## Connect Claude Desktop to your MCP server
+```bash
+ATLAS_QMD_DB=/tmp/atlas-qmd.sqlite npm run dev
+```
 
-You can also connect to your remote MCP server from local MCP clients, by using the [mcp-remote proxy](https://www.npmjs.com/package/mcp-remote).
+Atlas MCP discovers the canonical skill docs from `../atlas-skill/skills/atlas`
+when running from this repo. Override that path when needed:
 
-To connect to your MCP server from Claude Desktop, follow [Anthropic's Quickstart](https://modelcontextprotocol.io/quickstart/user) and within Claude Desktop go to Settings > Developer > Edit Config.
+```bash
+ATLAS_SKILL_DIR=/path/to/atlas/skills/atlas npm run dev
+```
 
-Update with this configuration:
+## Scripts
+
+```bash
+npm run dev            # local HTTP MCP server on localhost:8787
+npm run local:http     # same as dev
+npm run local:stdio    # stdio MCP server for local clients
+npm run local:index    # index local markdown into qmd and exit
+npm run smoke:local    # end-to-end local MCP smoke test
+```
+
+Worker scripts are explicit:
+
+```bash
+npm run worker:dev
+npm run worker:dev:local
+npm run deploy
+```
+
+## Local MCP Tools
+
+- `atlas_status`: show workspace, qmd, graph, and health status.
+- `atlas_index`: scan markdown into qmd. Optional `embed: true` generates vector embeddings.
+- `atlas_search`: query markdown through qmd. Defaults to fast lexical BM25.
+- `atlas_trace`: trace frontmatter relations, evidence, owners, and dissenting views.
+- `atlas_health_check`: lint local memory for broken relationships, stale objects, ownerless commitments, and metacognition warnings.
+- `atlas_list`: list local workspace files.
+- `atlas_read`: read one local UTF-8 file.
+- `atlas_read_many`: read up to 50 local UTF-8 files.
+- `atlas_context`: hydrate `_project.md`, `_state.md`, `_index.md`, `_log.md`, plus shallow `knowledge/` and `sources/` catalogs.
+- `atlas_write_source`: write a source/evidence text or markdown file locally and optionally re-index. This is not a full ingest agent.
+- `atlas_propose_patch`: validate an Atlas text patch against local files without writing.
+- `atlas_apply_patch`: apply an Atlas text patch locally and optionally re-index.
+
+## Skill Resources And Prompts
+
+Atlas MCP serves the canonical Atlas skill docs directly, so clients that support MCP resources/prompts can discover the workflow without a separate installed skill package.
+
+Resources:
+
+```text
+atlas://skill/SKILL.md
+atlas://skill/actions/ingest.md
+atlas://skill/actions/query.md
+atlas://skill/actions/lint.md
+atlas://skill/references/frontmatter.md
+atlas://skill/references/object-types.md
+```
+
+Prompts:
+
+```text
+atlas_ingest_workflow
+atlas_query_workflow
+atlas_lint_workflow
+atlas_memory_health_review
+atlas_decision_review
+```
+
+The separate installed skill directory should be treated as a generated compatibility artifact for clients that do not yet use MCP-served workflow docs well.
+
+## Query Flow
+
+```text
+ChatGPT / Claude / Codex
+  -> Atlas MCP
+  -> MCP-served Atlas workflow prompt/resource
+  -> qmd local retrieval
+  -> Atlas frontmatter graph parsing
+  -> evidence, stale-context, and metacognition packaging
+```
+
+Use `atlas_index` after files change. Then use `atlas_search` for candidate memory, `atlas_trace` for graph context, and `atlas_propose_patch` before `atlas_apply_patch` for client-orchestrated writes.
+
+Example MCP `atlas_search` arguments:
 
 ```json
 {
-	"mcpServers": {
-		"calculator": {
-			"command": "npx",
-			"args": [
-				"mcp-remote",
-				"http://localhost:8787/mcp" // or remote-mcp-server-authless.your-account.workers.dev/mcp
-			]
-		}
-	}
+  "query": "pricing packaging",
+  "mode": "lex",
+  "limit": 10
 }
 ```
 
-Restart Claude and you should see the tools become available.
+Hybrid qmd search is available when you want it:
+
+```json
+{
+  "mode": "hybrid",
+  "searches": [
+    { "type": "lex", "query": "\"pricing packaging\"" },
+    { "type": "vec", "query": "why did pricing packaging matter?" }
+  ],
+  "rerank": false,
+  "limit": 10
+}
+```
+
+For vector/hybrid quality, run `atlas_index` with `embed: true` first. That may download local qmd models.
+
+## Claude Desktop
+
+For stdio:
+
+```json
+{
+  "mcpServers": {
+    "atlas": {
+      "command": "npm",
+      "args": ["run", "local:stdio"],
+      "cwd": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-mcp",
+      "env": {
+        "ATLAS_WORKSPACE": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-data",
+        "ATLAS_SKILL_DIR": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-skill/skills/atlas"
+      }
+    }
+  }
+}
+```
+
+For Streamable HTTP clients, point them at:
+
+```text
+http://localhost:8787/mcp
+```

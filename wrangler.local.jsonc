@@ -1,0 +1,26 @@
+/**
+ * Local-only Wrangler config for behavior testing.
+ *
+ * Unlike wrangler.jsonc, this does not set the R2 binding to remote mode.
+ * Run with `npm run dev:local` to exercise the Worker against persisted local
+ * Miniflare storage under .wrangler/local-state.
+ */
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "atlas-mcp-local",
+	"main": "src/index.ts",
+	"compatibility_date": "2025-03-10",
+	"compatibility_flags": ["nodejs_compat"],
+	"observability": {
+		"enabled": false,
+	},
+	"assets": {
+		"directory": "./public",
+	},
+	"r2_buckets": [
+		{
+			"binding": "ATLAS_BUCKET",
+			"bucket_name": "atlas-local-bucket",
+		},
+	],
+}

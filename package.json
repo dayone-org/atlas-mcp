@@ -2,25 +2,35 @@
 	"name": "atlas-mcp",
 	"version": "0.0.0",
 	"private": true,
+	"type": "module",
 	"scripts": {
 		"deploy": "wrangler deploy",
-		"dev": "wrangler dev",
+		"dev": "npm run local:http",
+		"local:http": "tsx src/local/server.ts --http --port 8787 --workspace \"${ATLAS_WORKSPACE:-../atlas-data}\"",
+		"local:stdio": "tsx src/local/server.ts --stdio --workspace \"${ATLAS_WORKSPACE:-../atlas-data}\"",
+		"local:index": "tsx src/local/server.ts --index --workspace \"${ATLAS_WORKSPACE:-../atlas-data}\"",
+		"worker:dev": "wrangler dev",
+		"worker:dev:local": "wrangler dev -c wrangler.local.jsonc --persist-to .wrangler/local-state",
+		"smoke:local": "node scripts/smoke-local.mjs",
 		"format": "oxfmt --write .",
 		"lint:fix": "oxlint --fix",
-		"start": "wrangler dev",
+		"start": "npm run local:http",
 		"cf-typegen": "wrangler types",
 		"type-check": "tsc --noEmit"
 	},
 	"dependencies": {
 		"@modelcontextprotocol/sdk": "^1.29.0",
+		"@tobilu/qmd": "^2.1.0",
 		"agents": "^0.9.0",
+		"yaml": "^2.8.4",
 		"zod": "^4.3.6"
 	},
 	"devDependencies": {
 		"@types/node": "^25.6.0",
 		"oxfmt": "^0.43.0",
 		"oxlint": "^1.58.0",
-		"typescript": "6.0.2",
+		"tsx": "^4.21.0",
+		"typescript": "^5.9.3",
 		"wrangler": "^4.85.0"
 	}
 }
