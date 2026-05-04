@@ -10,6 +10,7 @@ const workspaceRoot = resolve(process.env.ATLAS_SMOKE_WORKSPACE ?? ".tmp/smoke-l
 const port = Number(process.env.ATLAS_SMOKE_PORT ?? 8797);
 const mcpUrl = new URL(`http://localhost:${port}/mcp`);
 const projectPath = "clients/local-test/projects/behavior-smoke";
+const uploadFixturePath = resolve(workspaceRoot, "../smoke-upload.bin");
 
 function assert(condition, message) {
 	if (!condition) {
@@ -55,6 +56,7 @@ async function waitForHealth() {
 
 await rm(workspaceRoot, { recursive: true, force: true });
 await mkdir(workspaceRoot, { recursive: true });
+await writeFile(uploadFixturePath, Buffer.from([0, 1, 2, 3, 4, 5]));
 
 const seedFiles = new Map([
 	["_atlas.md", "# Local Atlas Smoke\n\nLocal filesystem Atlas workspace.\n"],
@@ -75,31 +77,14 @@ const seedFiles = new Map([
 		`${projectPath}/knowledge/pricing.md`,
 		`---
 id: decision:local-pricing-smoke
-type: decision
 title: Local Pricing Smoke
-status: active
-scope: project
+updated_at: 2026-05-03T00:00:00Z
 owners:
   - person:local-owner
-confidence: high
-created_at: 2026-05-03T00:00:00Z
-updated_at: 2026-05-03T00:00:00Z
 relations:
   supports:
     - strategy:local-enterprise-expansion
-evidence:
-  - id: evidence:local-kickoff
-    source: source:local-kickoff
-    claim: "Pricing packaging was confirmed as the smoke-test decision."
-    support: supports
-    confidence: high
-metacognition:
-  evidence_strength: strong
-  reasoning_status: reviewed
-  agent_guidance:
-    safe_to_answer: true
-    safe_to_act: false
-    escalation_reason: "Smoke fixture intentionally blocks autonomous action."
+    - source:local-kickoff
 ---
 
 # Local Pricing Smoke
@@ -111,10 +96,7 @@ Pricing packaging is the durable decision used to test local Atlas search and tr
 		`${projectPath}/knowledge/strategy.md`,
 		`---
 id: strategy:local-enterprise-expansion
-type: strategy
 title: Local Enterprise Expansion
-status: active
-created_at: 2026-05-03T00:00:00Z
 updated_at: 2026-05-03T00:00:00Z
 ---
 
@@ -127,10 +109,7 @@ The smoke strategy is supported by the local pricing decision.
 		`${projectPath}/sources/kickoff.md`,
 		`---
 id: source:local-kickoff
-type: source
 title: Local Kickoff Source
-status: active
-created_at: 2026-05-03T00:00:00Z
 updated_at: 2026-05-03T00:00:00Z
 ---
 
@@ -182,23 +161,20 @@ try {
 	try {
 		const tools = await client.listTools();
 		const toolNames = tools.tools.map((tool) => tool.name).sort();
-
-		for (const expected of [
+		const expectedTools = [
 			"atlas_apply_patch",
-			"atlas_health_check",
-			"atlas_index",
-			"atlas_list",
 			"atlas_context",
-			"atlas_propose_patch",
-			"atlas_read",
-			"atlas_read_many",
+			"atlas_health_check",
 			"atlas_search",
 			"atlas_status",
 			"atlas_trace",
-			"atlas_write_source",
-		]) {
-			assert(toolNames.includes(expected), `Expected MCP tool ${expected}.`);
-		}
+			"atlas_upload_file",
+		].sort();
+
+		assert(
+			JSON.stringify(toolNames) === JSON.stringify(expectedTools),
+			`Expected slim MCP tool surface ${expectedTools.join(", ")} but got ${toolNames.join(", ")}.`,
+		);
 
 		const resources = await client.listResources();
 		assert(
@@ -233,14 +209,16 @@ try {
 			"Expected MCP-served prompt to include the Atlas skill and requested scope.",
 		);
 
-		const index = jsonContent(
+		const status = jsonContent(
 			await client.callTool({
-				name: "atlas_index",
-				arguments: {},
+				name: "atlas_status",
+				arguments: {
+					refreshIndex: true,
+				},
 			}),
 		);
-		assert(index.ok === true, "index should return ok: true.");
-		assert(index.update.indexed >= 1, "index should index markdown files.");
+		assert(status.ok === true, "status should return ok: true.");
+		assert(status.refreshedIndex.indexed >= 1, "status refresh should index markdown files.");
 
 		const search = jsonContent(
 			await client.callTool({
@@ -270,42 +248,75 @@ try {
 		assert(context.ok === true, "atlas_context should return ok: true.");
 		assert(context.coreFiles.length === 4, "atlas_context should return all four core files.");
 
-			const patchInput = [
-				"*** Begin Patch",
-				`*** Update File: ${projectPath}/_log.md`,
-				"@@",
-				" # Log",
-				" ",
-				" - Seeded local qmd MCP smoke project.",
-				"+- Proposed patch validation works.",
-				"*** End Patch",
-				"",
-			].join("\n");
-
-			const proposedPatch = jsonContent(
-				await client.callTool({
-					name: "atlas_propose_patch",
-					arguments: {
-						input: patchInput,
-					},
-				}),
-			);
-		assert(proposedPatch.ok === true, "atlas_propose_patch should validate a matching patch.");
-		assert(
-			proposedPatch.touched.includes(`${projectPath}/_log.md`),
-			"atlas_propose_patch should report touched files.",
-		);
-		const logAfterProposal = textContent(
+		const fileContext = jsonContent(
 			await client.callTool({
-				name: "atlas_read",
+				name: "atlas_context",
 				arguments: {
-					path: `${projectPath}/_log.md`,
+					path: `${projectPath}/knowledge/pricing.md`,
 				},
 			}),
 		);
+		assert(fileContext.ok === true, "atlas_context should support singular file paths.");
+		assert(fileContext.files[0].ok === true, "atlas_context should read the requested file.");
 		assert(
-			!logAfterProposal.includes("Proposed patch validation works."),
-			"atlas_propose_patch must not write files.",
+			fileContext.files[0].content.includes("Local Pricing Smoke"),
+			"atlas_context singular file read should return file content.",
+		);
+
+		const upload = jsonContent(
+			await client.callTool({
+				name: "atlas_upload_file",
+				arguments: {
+					localPath: uploadFixturePath,
+					path: `${projectPath}/sources/raw-upload.bin`,
+					indexAfterUpload: false,
+				},
+			}),
+		);
+		assert(upload.ok === true, "atlas_upload_file should copy a local file.");
+		assert(upload.bytes === 6, "atlas_upload_file should return byte size.");
+		assert(
+			upload.warnings?.some((warning) => warning.type === "source_upload_requires_knowledge_update"),
+			"atlas_upload_file should warn that source uploads still require knowledge updates.",
+		);
+
+		const patchInput = [
+			"*** Begin Patch",
+			`*** Update File: ${projectPath}/_log.md`,
+			"@@",
+			" # Log",
+			" ",
+			" - Seeded local qmd MCP smoke project.",
+			"+- Patch application works.",
+			"*** End Patch",
+			"",
+		].join("\n");
+
+		const appliedPatch = jsonContent(
+			await client.callTool({
+				name: "atlas_apply_patch",
+				arguments: {
+					input: patchInput,
+				},
+			}),
+		);
+		assert(appliedPatch.ok === true, "atlas_apply_patch should apply a matching patch.");
+		assert(
+			appliedPatch.touched.includes(`${projectPath}/_log.md`),
+			"atlas_apply_patch should report touched files.",
+		);
+		const contextAfterPatch = jsonContent(
+			await client.callTool({
+				name: "atlas_context",
+				arguments: {
+					paths: [`${projectPath}/_log.md`],
+				},
+			}),
+		);
+		const logAfterPatch = contextAfterPatch.files[0].content;
+		assert(
+			logAfterPatch.includes("Patch application works."),
+			"atlas_apply_patch should write files.",
 		);
 
 		const trace = jsonContent(
@@ -324,7 +335,7 @@ try {
 		);
 		assert(
 			trace.edges.some((edge) => edge.to === "source:local-kickoff"),
-			"trace should include the evidence edge to source.",
+			"trace should include the supports edge to source.",
 		);
 
 		const health = jsonContent(
@@ -334,10 +345,6 @@ try {
 			}),
 		);
 		assert(health.ok === true, "health_check should not have errors.");
-		assert(
-			health.issues.some((issue) => issue.type === "agent_action_requires_review"),
-			"health_check should surface safe_to_act=false guidance.",
-		);
 
 		console.log(
 			JSON.stringify(
@@ -346,7 +353,8 @@ try {
 					url: mcpUrl.toString(),
 					workspaceRoot,
 					tools: toolNames,
-					indexed: index.update.indexed,
+					indexed: status.refreshedIndex.indexed,
+					uploadBytes: upload.bytes,
 					searchResults: search.results.length,
 					traceEdges: trace.edges.length,
 					healthIssues: health.issues.length,

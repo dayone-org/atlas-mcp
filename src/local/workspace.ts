@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import {
 	access,
+	copyFile,
 	mkdir,
 	readFile,
 	readdir,
@@ -13,6 +15,7 @@ import YAML from "yaml";
 
 export const PROJECT_CORE_FILE_NAMES = ["_project.md", "_state.md", "_index.md", "_log.md"] as const;
 export const MAX_TEXT_FILE_BYTES = 1024 * 1024;
+export const MAX_UPLOAD_FILE_BYTES = 250 * 1024 * 1024;
 
 const IGNORED_DIRECTORY_NAMES = new Set([
 	".atlas",
@@ -24,6 +27,16 @@ const IGNORED_DIRECTORY_NAMES = new Set([
 	"node_modules",
 	"vendor",
 ]);
+
+const RELATION_KEYS = [
+	"supersedes",
+	"supports",
+	"contradicts",
+	"depends_on",
+	"related_to",
+] as const;
+
+type RelationKey = (typeof RELATION_KEYS)[number];
 
 type PatchOperation =
 	| {
@@ -51,17 +64,8 @@ type PatchHunkLine = {
 };
 
 export type AtlasRelation = {
-	type: string;
+	type: RelationKey;
 	target: string;
-};
-
-export type AtlasEvidence = {
-	id?: string;
-	source?: string;
-	claim?: string;
-	support?: string;
-	confidence?: string;
-	observedAt?: string;
 };
 
 export type AtlasObject = {
@@ -69,21 +73,9 @@ export type AtlasObject = {
 	id?: string;
 	type?: string;
 	title: string;
-	status?: string;
-	scope?: string;
-	visibility?: string;
-	confidence?: string;
 	owners: string[];
-	tags: string[];
-	sourceSystems: string[];
-	createdAt?: string;
 	updatedAt?: string;
-	validFrom?: string;
-	validUntil?: string;
-	staleAfter?: string;
 	relations: AtlasRelation[];
-	evidence: AtlasEvidence[];
-	metacognition?: Record<string, unknown>;
 	hasFrontmatter: boolean;
 	frontmatterError?: string;
 };
@@ -92,12 +84,10 @@ export type AtlasEdge = {
 	from: string;
 	to: string;
 	type: string;
-	kind: "relation" | "evidence" | "metadata" | "metacognition";
+	kind: "relation" | "metadata";
 	resolved: boolean;
 	sourcePath: string;
 	targetPath?: string;
-	evidenceId?: string;
-	claim?: string;
 };
 
 export type AtlasGraph = {
@@ -130,6 +120,17 @@ type NormalizeOptions = {
 
 function errorMessage(error: unknown) {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function sha256File(absolutePath: string) {
+	return new Promise<string>((resolve, reject) => {
+		const hash = createHash("sha256");
+		const stream = createReadStream(absolutePath);
+
+		stream.on("data", (chunk) => hash.update(chunk));
+		stream.on("error", reject);
+		stream.on("end", () => resolve(hash.digest("hex")));
+	});
 }
 
 function hasControlCharacter(value: string) {
@@ -205,10 +206,6 @@ function basename(input: string) {
 	return parts[parts.length - 1] ?? input;
 }
 
-function toPosixPath(input: string) {
-	return input.split(path.sep).join("/");
-}
-
 function fromPosixPath(input: string) {
 	return input.split("/").join(path.sep);
 }
@@ -256,76 +253,37 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
 	return value as Record<string, unknown>;
 }
 
-function parseRelations(value: unknown) {
-	const relations: AtlasRelation[] = [];
-
-	if (Array.isArray(value)) {
-		for (const item of value) {
-			const record = objectRecord(item);
-			const type = record ? scalar(record.type ?? record.relation ?? record.kind) : undefined;
-			const target = record ? scalar(record.target ?? record.to ?? record.id ?? record.path) : undefined;
-
-			if (type && target) {
-				relations.push({ type, target });
-			}
-		}
-
-		return relations;
-	}
-
+function parseRelations(value: unknown): AtlasRelation[] {
 	const record = objectRecord(value);
 
 	if (!record) {
-		return relations;
+		return [];
 	}
 
-	for (const [type, targets] of Object.entries(record)) {
-		if (Array.isArray(targets)) {
-			for (const target of targets) {
-				const targetValue = scalar(target);
+	const relations: AtlasRelation[] = [];
 
-				if (targetValue) {
-					relations.push({ type, target: targetValue });
-				}
-			}
+	for (const key of RELATION_KEYS) {
+		const targets = record[key];
+
+		if (!targets) {
 			continue;
 		}
 
-		const target = scalar(targets);
-
-		if (target) {
-			relations.push({ type, target });
+		for (const target of stringArray(targets)) {
+			relations.push({ type: key, target });
 		}
 	}
 
 	return relations;
 }
 
-function parseEvidence(value: unknown) {
-	if (!Array.isArray(value)) {
-		return [];
+function typeFromId(id: string | undefined) {
+	if (!id) {
+		return undefined;
 	}
 
-	const evidence: AtlasEvidence[] = [];
-
-	for (const item of value) {
-		const record = objectRecord(item);
-
-		if (!record) {
-			continue;
-		}
-
-		evidence.push({
-			id: scalar(record.id),
-			source: scalar(record.source),
-			claim: scalar(record.claim),
-			support: scalar(record.support),
-			confidence: scalar(record.confidence),
-			observedAt: scalar(record.observed_at ?? record.observedAt),
-		});
-	}
-
-	return evidence;
+	const match = id.match(/^([a-z][a-z0-9_]*):/i);
+	return match ? match[1] : undefined;
 }
 
 function extractFrontmatter(content: string) {
@@ -378,10 +336,6 @@ function titleFromBody(body: string, filePath: string) {
 	return basename(filePath).replace(/\.md$/i, "");
 }
 
-function isAtlasIdLike(value: string) {
-	return /^[a-z][a-z0-9_]*:[^\s]+$/i.test(value);
-}
-
 function targetLooksLikePath(value: string) {
 	return (
 		value.endsWith(".md") ||
@@ -417,51 +371,19 @@ function isKnowledgePath(filePath: string) {
 function requiredFrontmatterFields(object: AtlasObject) {
 	const missing: string[] = [];
 
-	for (const field of ["id", "type", "title", "status", "created_at", "updated_at"] as const) {
-		if (field === "created_at") {
-			if (!object.createdAt) {
-				missing.push(field);
-			}
-			continue;
-		}
+	if (!object.id) {
+		missing.push("id");
+	}
 
-		if (field === "updated_at") {
-			if (!object.updatedAt) {
-				missing.push(field);
-			}
-			continue;
-		}
+	if (!object.title) {
+		missing.push("title");
+	}
 
-		if (!object[field]) {
-			missing.push(field);
-		}
+	if (!object.updatedAt) {
+		missing.push("updated_at");
 	}
 
 	return missing;
-}
-
-function extractDissentingViews(metacognition: Record<string, unknown> | undefined) {
-	const views = metacognition ? metacognition.dissenting_views : undefined;
-	return stringArray(views);
-}
-
-function safeToAct(metacognition: Record<string, unknown> | undefined) {
-	const guidance = objectRecord(metacognition?.agent_guidance);
-	return typeof guidance?.safe_to_act === "boolean" ? guidance.safe_to_act : undefined;
-}
-
-function dateIsPast(value: string | undefined, now: Date) {
-	if (!value) {
-		return false;
-	}
-
-	const timestamp = Date.parse(value);
-
-	if (Number.isNaN(timestamp)) {
-		return false;
-	}
-
-	return timestamp < now.getTime();
 }
 
 function makeIssue(
@@ -794,6 +716,51 @@ export class LocalAtlasWorkspace {
 		};
 	}
 
+	async uploadFile(localPath: string, workspacePath: string, options?: { overwrite?: boolean }) {
+		if (!path.isAbsolute(localPath)) {
+			throw new Error("localPath must be an absolute filesystem path.");
+		}
+
+		const sourceAbsolute = path.resolve(localPath);
+		const { workspacePath: normalized, absolute } = this.resolvePath(workspacePath);
+		const info = await stat(sourceAbsolute);
+
+		if (!info.isFile()) {
+			throw new Error(`${sourceAbsolute} is not a file.`);
+		}
+
+		if (info.size > MAX_UPLOAD_FILE_BYTES) {
+			throw new Error(`${sourceAbsolute} is too large to upload (${info.size} bytes).`);
+		}
+
+		if (sourceAbsolute === absolute) {
+			throw new Error("Source and destination paths are the same file.");
+		}
+
+		if (!options?.overwrite) {
+			try {
+				await access(absolute);
+				throw new Error(`${normalized} already exists. Pass overwrite: true to replace it.`);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+					throw error;
+				}
+			}
+		}
+
+		await mkdir(path.dirname(absolute), { recursive: true });
+		await copyFile(sourceAbsolute, absolute);
+
+		return {
+			ok: true,
+			path: normalized,
+			localPath: sourceAbsolute,
+			bytes: info.size,
+			sha256: await sha256File(absolute),
+			overwritten: Boolean(options?.overwrite),
+		};
+	}
+
 	async list(workspacePath = "/") {
 		const { workspacePath: normalized, absolute } = this.resolvePath(workspacePath, {
 			allowRoot: true,
@@ -934,28 +901,16 @@ export class LocalAtlasWorkspace {
 		const content = await this.readText(normalized);
 		const parsed = extractFrontmatter(content);
 		const frontmatter = parsed.frontmatter ?? {};
-		const metacognition = objectRecord(frontmatter.metacognition);
+		const id = scalar(frontmatter.id);
 
 		return {
 			path: normalized,
-			id: scalar(frontmatter.id),
-			type: scalar(frontmatter.type),
+			id,
+			type: typeFromId(id),
 			title: scalar(frontmatter.title) ?? titleFromBody(parsed.body, normalized),
-			status: scalar(frontmatter.status),
-			scope: scalar(frontmatter.scope),
-			visibility: scalar(frontmatter.visibility),
-			confidence: scalar(frontmatter.confidence),
 			owners: stringArray(frontmatter.owners),
-			tags: stringArray(frontmatter.tags),
-			sourceSystems: stringArray(frontmatter.source_systems ?? frontmatter.sourceSystems),
-			createdAt: scalar(frontmatter.created_at ?? frontmatter.createdAt),
 			updatedAt: scalar(frontmatter.updated_at ?? frontmatter.updatedAt),
-			validFrom: scalar(frontmatter.valid_from ?? frontmatter.validFrom),
-			validUntil: scalar(frontmatter.valid_until ?? frontmatter.validUntil),
-			staleAfter: scalar(frontmatter.stale_after ?? frontmatter.staleAfter),
 			relations: parseRelations(frontmatter.relations),
-			evidence: parseEvidence(frontmatter.evidence),
-			...(metacognition ? { metacognition } : {}),
 			hasFrontmatter: parsed.hasFrontmatter,
 			...(parsed.error ? { frontmatterError: parsed.error } : {}),
 		};
@@ -1035,25 +990,6 @@ export class LocalAtlasWorkspace {
 				});
 			}
 
-			for (const evidence of object.evidence) {
-				if (!evidence.source) {
-					continue;
-				}
-
-				const resolution = resolveTarget(evidence.source, object.path);
-				edges.push({
-					from,
-					to: evidence.source,
-					type: evidence.support ?? "evidence",
-					kind: "evidence",
-					sourcePath: object.path,
-					resolved: resolution.resolved,
-					...(resolution.targetPath ? { targetPath: resolution.targetPath } : {}),
-					...(evidence.id ? { evidenceId: evidence.id } : {}),
-					...(evidence.claim ? { claim: evidence.claim } : {}),
-				});
-			}
-
 			for (const owner of object.owners) {
 				const resolution = resolveTarget(owner, object.path);
 				edges.push({
@@ -1066,23 +1002,10 @@ export class LocalAtlasWorkspace {
 					...(resolution.targetPath ? { targetPath: resolution.targetPath } : {}),
 				});
 			}
-
-			for (const dissent of extractDissentingViews(object.metacognition)) {
-				const resolution = resolveTarget(dissent, object.path);
-				edges.push({
-					from,
-					to: dissent,
-					type: "dissenting_view",
-					kind: "metacognition",
-					sourcePath: object.path,
-					resolved: resolution.resolved,
-					...(resolution.targetPath ? { targetPath: resolution.targetPath } : {}),
-				});
-			}
 		}
 
 		for (const edge of edges) {
-			if (!edge.resolved && edge.kind !== "metadata" && edge.kind !== "metacognition") {
+			if (!edge.resolved && edge.kind !== "metadata") {
 				warnings.push({
 					severity: "warning",
 					type: "unresolved_edge",
@@ -1111,7 +1034,6 @@ export class LocalAtlasWorkspace {
 
 	async healthCheck() {
 		const graph = await this.buildGraph();
-		const now = new Date();
 		const issues: AtlasHealthIssue[] = [...graph.warnings];
 
 		for (const object of graph.objects) {
@@ -1146,39 +1068,6 @@ export class LocalAtlasWorkspace {
 						"missing_frontmatter",
 						object,
 						"Knowledge/source page has no Atlas frontmatter yet.",
-					),
-				);
-			}
-
-			if (object.status === "active" && dateIsPast(object.staleAfter, now)) {
-				issues.push(
-					makeIssue(
-						"warning",
-						"stale_object",
-						object,
-						`Object is active but stale_after has passed (${object.staleAfter}).`,
-					),
-				);
-			}
-
-			if (object.type === "commitment" && object.status === "active" && object.owners.length === 0) {
-				issues.push(
-					makeIssue(
-						"warning",
-						"ownerless_commitment",
-						object,
-						"Active commitment has no owner.",
-					),
-				);
-			}
-
-			if (safeToAct(object.metacognition) === false) {
-				issues.push(
-					makeIssue(
-						"info",
-						"agent_action_requires_review",
-						object,
-						"Metacognition says this object is not safe for autonomous action.",
 					),
 				);
 			}
@@ -1327,20 +1216,6 @@ export class LocalAtlasWorkspace {
 		return {
 			operations,
 			staged,
-		};
-	}
-
-	async proposeTextPatch(input: string) {
-		const { operations, staged } = await this.stageTextPatch(input);
-
-		return {
-			ok: true,
-			mode: "propose" as const,
-			touched: [...staged.keys()],
-			operations: operations.map((operation) => ({
-				kind: operation.kind,
-				path: operation.path,
-			})),
 		};
 	}
 

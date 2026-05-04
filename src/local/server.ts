@@ -37,6 +37,7 @@ type SearchInput = {
 	minScore?: number;
 	intent?: string;
 	rerank?: boolean;
+	refreshIndex?: boolean;
 };
 
 type RuntimeOptions = {
@@ -162,10 +163,10 @@ function formatInstructions(runtime: LocalAtlasRuntime) {
 		`Workspace: ${runtime.workspace.root}`,
 		`QMD collection: ${runtime.collectionName}`,
 		"",
-		"Use `atlas_index` after files change, then use `atlas_search` for retrieval and `atlas_trace` for frontmatter graph context.",
+		"Use `atlas_search` for refreshed retrieval, `atlas_context` for exact reads, and `atlas_trace` for frontmatter graph context.",
 		"Markdown files remain canonical. qmd is used only as the local retrieval index.",
 		"Atlas workflow docs are served as MCP resources under atlas://skill/... and as workflow prompts such as atlas_ingest_workflow.",
-		"Respect frontmatter metacognition: stale context, weak evidence, unresolved relations, and safe_to_act=false should be surfaced before action.",
+		"Frontmatter is intentionally minimal: id, title, updated_at, optional owners, and optional relations (supersedes, supports, contradicts, depends_on, related_to). Lifecycle is derived from the graph and timestamps.",
 	].join("\n");
 }
 
@@ -189,15 +190,9 @@ function objectSummary(object: AtlasObject | undefined) {
 		id: object.id ?? null,
 		type: object.type ?? null,
 		title: object.title,
-		status: object.status ?? null,
-		confidence: object.confidence ?? null,
-		visibility: object.visibility ?? null,
 		owners: object.owners,
-		tags: object.tags,
-		staleAfter: object.staleAfter ?? null,
-		metacognition: object.metacognition ?? null,
+		updatedAt: object.updatedAt ?? null,
 		relationCount: object.relations.length,
-		evidenceCount: object.evidence.length,
 	};
 }
 
@@ -249,7 +244,7 @@ export class LocalAtlasRuntime {
 				dbPath: this.dbPath,
 				config: {
 					global_context:
-						"Atlas local markdown company brain. Frontmatter carries object identity, relationships, evidence, temporal state, visibility, and metacognition.",
+						"Atlas local markdown company brain. Frontmatter carries id, title, updated_at, owners, and a small set of relations.",
 					collections: {
 						[this.collectionName]: {
 							path: this.workspace.root,
@@ -267,8 +262,8 @@ export class LocalAtlasRuntime {
 								{
 									"/": "Atlas markdown memory workspace.",
 									"/clients": "Client and project-scoped Atlas memory.",
-									"/sources": "Immutable or source-centered evidence pages.",
-									"/knowledge": "Maintained knowledge objects and evidence pages.",
+									"/sources": "Source markdown records.",
+									"/knowledge": "Maintained knowledge objects.",
 								},
 						},
 					},
@@ -322,7 +317,8 @@ export class LocalAtlasRuntime {
 		};
 	}
 
-	async status() {
+	async status(options: { refreshIndex?: boolean } = {}) {
+		const refreshed = options.refreshIndex ? await this.index() : undefined;
 		const store = await this.getStore();
 		const [qmd, graph, health, skillLibrary] = await Promise.all([
 			store.getStatus(),
@@ -336,6 +332,7 @@ export class LocalAtlasRuntime {
 			workspaceRoot: this.workspace.root,
 			dbPath: this.dbPath,
 			collection: this.collectionName,
+			...(refreshed ? { refreshedIndex: refreshed.update } : {}),
 			qmd,
 			graph: graph.summary,
 			health: {
@@ -355,6 +352,7 @@ export class LocalAtlasRuntime {
 	}
 
 	async search(input: SearchInput) {
+		const refreshed = input.refreshIndex === false ? undefined : await this.index();
 		const store = await this.getStore();
 		const graph = await this.workspace.buildGraph();
 		const limit = input.limit ?? 10;
@@ -390,10 +388,40 @@ export class LocalAtlasRuntime {
 			ok: true,
 			mode,
 			query,
+			...(refreshed ? { refreshedIndex: refreshed.update } : {}),
 			results: results.map((result) => formatSearchResult(result, graph, this.collectionName, query)),
 			graphWarnings: graph.warnings,
 		};
 	}
+}
+
+function sourcePatchWarning(paths: string[]) {
+	const touchesSource = paths.some((workspacePath) => workspacePath.includes("/sources/"));
+	const touchesKnowledge = paths.some((workspacePath) => workspacePath.includes("/knowledge/"));
+
+	if (!touchesSource || touchesKnowledge) {
+		return undefined;
+	}
+
+	return {
+		severity: "warning" as const,
+		type: "source_without_knowledge_update",
+		message:
+			"Patch touches sources/ but no knowledge/ page. For source ingest, Atlas is incomplete until at least one knowledge page is created or updated.",
+	};
+}
+
+function sourceUploadWarning(workspacePath: string) {
+	if (!workspacePath.includes("/sources/")) {
+		return undefined;
+	}
+
+	return {
+		severity: "warning" as const,
+		type: "source_upload_requires_knowledge_update",
+		message:
+			"File uploaded under sources/. Source ingest is incomplete until a source markdown record and at least one knowledge page are created or updated.",
+	};
 }
 
 async function createMcpServer(runtime: LocalAtlasRuntime) {
@@ -463,30 +491,20 @@ async function createMcpServer(runtime: LocalAtlasRuntime) {
 	server.registerTool(
 		"atlas_status",
 		{
-			description: "Show local Atlas workspace, qmd index, graph, and health status.",
-			inputSchema: {},
-		},
-		async () => jsonContent(await runtime.status()),
-	);
-
-	server.registerTool(
-		"atlas_index",
-		{
 			description:
-				"Index the local markdown workspace into qmd. Set embed=true only when you want local vector embeddings and model downloads.",
+				"Show local Atlas workspace, qmd index, graph, health, and served skill status. Set refreshIndex=true after out-of-band file changes.",
 			inputSchema: {
-				embed: z.boolean().default(false),
-				forceEmbed: z.boolean().default(false),
+				refreshIndex: z.boolean().default(false),
 			},
 		},
-		async ({ embed, forceEmbed }) => jsonContent(await runtime.index({ embed, forceEmbed })),
+		async ({ refreshIndex }) => jsonContent(await runtime.status({ refreshIndex })),
 	);
 
 	server.registerTool(
 		"atlas_search",
 		{
 			description:
-				"Search Atlas markdown locally via qmd. Default mode is lex for fast BM25; use hybrid/vector after embeddings are available.",
+				"Refresh and search Atlas markdown locally via qmd. Default mode is lex for fast BM25; use hybrid/vector after embeddings are available.",
 			inputSchema: {
 				query: z.string().optional(),
 				searches: z
@@ -502,65 +520,58 @@ async function createMcpServer(runtime: LocalAtlasRuntime) {
 				minScore: z.number().min(0).max(1).default(0),
 				intent: z.string().optional(),
 				rerank: z.boolean().default(false),
+				refreshIndex: z.boolean().default(true),
 			},
 		},
 		async (input) => jsonContent(await runtime.search(input)),
 	);
 
 	server.registerTool(
-		"atlas_list",
-		{
-			description: "List files and directories in the local Atlas workspace.",
-			inputSchema: {
-				path: z.string().default("/"),
-			},
-		},
-		async ({ path: workspacePath }) => jsonContent(await runtime.workspace.list(workspacePath)),
-	);
-
-	server.registerTool(
-		"atlas_read",
-		{
-			description: "Read a UTF-8 text file from the local Atlas workspace.",
-			inputSchema: {
-				path: z.string().min(1),
-			},
-		},
-		async ({ path: workspacePath }) => textContent(await runtime.workspace.readText(workspacePath)),
-	);
-
-	server.registerTool(
-		"atlas_read_many",
-		{
-			description: "Read multiple UTF-8 text files from the local Atlas workspace in one call.",
-			inputSchema: {
-				paths: z.array(z.string()).min(1).max(50),
-			},
-		},
-		async ({ paths }) =>
-			jsonContent({
-				ok: true,
-				results: await runtime.workspace.readMany(paths),
-			}),
-	);
-
-	server.registerTool(
 		"atlas_context",
 		{
 			description:
-				"Read core Atlas project files and shallow knowledge/source catalogs from local disk.",
+				"Hydrate a project scope, read exact Atlas paths, or list a workspace directory. A singular path ending in .md is treated as an exact file read.",
 			inputSchema: {
-				path: z.string().min(1),
+				path: z.string().optional(),
+				paths: z.array(z.string()).min(1).max(50).optional(),
+				listPath: z.string().optional(),
 			},
 		},
-		async ({ path: workspacePath }) => jsonContent(await runtime.workspace.projectContext(workspacePath)),
+		async ({ path: workspacePath, paths, listPath }) => {
+			if (workspacePath && !paths && !listPath) {
+				if (workspacePath.endsWith(".md")) {
+					return jsonContent({
+						ok: true,
+						files: await runtime.workspace.readMany([workspacePath]),
+					});
+				}
+
+				return jsonContent(await runtime.workspace.projectContext(workspacePath));
+			}
+
+			const result: Record<string, unknown> = {
+				ok: true,
+			};
+
+			if (workspacePath) {
+				result.project = await runtime.workspace.projectContext(workspacePath);
+			}
+
+			if (paths) {
+				result.files = await runtime.workspace.readMany(paths);
+			}
+
+			result.listing = await runtime.workspace.list(listPath ?? "/");
+
+			return jsonContent(result);
+		},
 	);
 
 	server.registerTool(
 		"atlas_trace",
 		{
 			description:
-				"Trace Atlas frontmatter graph relations, evidence links, owners, and dissenting views from an Atlas ID or markdown path.",
+				"Trace Atlas frontmatter graph relations (supersedes, supports, contradicts, depends_on, related_to) and owners from an Atlas ID or markdown path.",
 			inputSchema: {
 				idOrPath: z.string().min(1),
 				depth: z.number().int().min(1).max(5).default(2),
@@ -573,63 +584,58 @@ async function createMcpServer(runtime: LocalAtlasRuntime) {
 		"atlas_health_check",
 		{
 			description:
-				"Lint local Atlas memory for broken relationships, missing typed frontmatter, stale objects, ownerless commitments, and agent guidance warnings.",
+				"Lint local Atlas memory for broken relationships, frontmatter parse errors, and missing required fields (id, title, updated_at).",
 			inputSchema: {},
 		},
 		async () => jsonContent(await runtime.workspace.healthCheck()),
 	);
 
 	server.registerTool(
-		"atlas_write_source",
+		"atlas_upload_file",
 		{
 			description:
-				"Write a source/evidence text or markdown file into the local Atlas workspace. This is a deterministic write primitive, not a full ingest workflow.",
+				"Copy a local filesystem file directly into the Atlas workspace. localPath must be absolute. Use for original binary artifacts; do not base64-encode files in prompts or patches.",
 			inputSchema: {
+				localPath: z.string().min(1),
 				path: z.string().min(1),
-				content: z.string(),
 				overwrite: z.boolean().default(false),
-				indexAfterWrite: z.boolean().default(true),
+				indexAfterUpload: z.boolean().default(true),
 			},
 		},
-		async ({ path: workspacePath, content, overwrite, indexAfterWrite }) => {
-			const write = await runtime.workspace.writeText(workspacePath, content, { overwrite });
-			const index = indexAfterWrite ? await runtime.index() : undefined;
+		async ({ localPath, path: workspacePath, overwrite, indexAfterUpload }) => {
+			const upload = await runtime.workspace.uploadFile(localPath, workspacePath, { overwrite });
+			const index = indexAfterUpload ? await runtime.index() : undefined;
+			const warning = sourceUploadWarning(upload.path);
 
 			return jsonContent({
-				...write,
+				...upload,
 				...(index ? { index: index.update } : {}),
+				...(warning ? { warnings: [warning] } : {}),
 			});
 		},
 	);
 
 	server.registerTool(
-		"atlas_propose_patch",
-		{
-			description:
-				"Validate an Atlas text patch against local files without writing. Use this before atlas_apply_patch when the client is orchestrating memory updates.",
-			inputSchema: {
-				input: z.string().min(1),
-			},
-		},
-		async ({ input }) => jsonContent(await runtime.workspace.proposeTextPatch(input)),
-	);
-
-	server.registerTool(
 		"atlas_apply_patch",
 		{
-			description: "Apply a text patch to files in the local Atlas workspace.",
-			inputSchema: {
-				input: z.string().min(1),
-				indexAfterWrite: z.boolean().default(true),
-			},
+			description:
+				"Apply a text patch to local Atlas memory. The patch is staged and validated before files are written; successful writes re-index by default.",
+			inputSchema: z
+				.object({
+					input: z.string().min(1),
+					indexAfterWrite: z.boolean().default(true),
+				})
+				.strict(),
 		},
 		async ({ input, indexAfterWrite }) => {
 			const patch = await runtime.workspace.applyTextPatch(input);
 			const index = indexAfterWrite ? await runtime.index() : undefined;
+			const warning = sourcePatchWarning(patch.touched);
 
 			return jsonContent({
 				...patch,
 				...(index ? { index: index.update } : {}),
+				...(warning ? { warnings: [warning] } : {}),
 			});
 		},
 	);

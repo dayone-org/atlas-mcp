@@ -6,7 +6,7 @@ The current development path is intentionally local:
 
 - markdown files on local disk are canonical memory
 - qmd provides the local retrieval index
-- Atlas parses frontmatter for object metadata, graph edges, evidence, and metacognition
+- Atlas parses minimal frontmatter (id, title, updated_at, owners, relations) for graph edges
 - Atlas MCP serves the canonical Atlas workflow docs as MCP resources and prompts
 - no Cloudflare Workers or R2 are required for behavior testing
 
@@ -90,18 +90,21 @@ npm run deploy
 
 ## Local MCP Tools
 
-- `atlas_status`: show workspace, qmd, graph, and health status.
-- `atlas_index`: scan markdown into qmd. Optional `embed: true` generates vector embeddings.
-- `atlas_search`: query markdown through qmd. Defaults to fast lexical BM25.
-- `atlas_trace`: trace frontmatter relations, evidence, owners, and dissenting views.
-- `atlas_health_check`: lint local memory for broken relationships, stale objects, ownerless commitments, and metacognition warnings.
-- `atlas_list`: list local workspace files.
-- `atlas_read`: read one local UTF-8 file.
-- `atlas_read_many`: read up to 50 local UTF-8 files.
-- `atlas_context`: hydrate `_project.md`, `_state.md`, `_index.md`, `_log.md`, plus shallow `knowledge/` and `sources/` catalogs.
-- `atlas_write_source`: write a source/evidence text or markdown file locally and optionally re-index. This is not a full ingest agent.
-- `atlas_propose_patch`: validate an Atlas text patch against local files without writing.
-- `atlas_apply_patch`: apply an Atlas text patch locally and optionally re-index.
+Atlas intentionally exposes a small semantic tool surface:
+
+- `atlas_status`: show workspace, qmd, graph, skill, and health status. Set `refreshIndex: true` after out-of-band file changes.
+- `atlas_search`: refresh and query markdown through qmd. Defaults to fast lexical BM25.
+- `atlas_context`: hydrate a project scope, read exact files with `paths`, or list a directory with `listPath`.
+- `atlas_trace`: trace frontmatter relations (supersedes, supports, contradicts, depends_on, related_to) and owners.
+- `atlas_health_check`: lint local memory for broken relationships, frontmatter parse errors, and missing required fields (id, title, updated_at).
+- `atlas_upload_file`: copy an absolute local filesystem path directly into the Atlas workspace. Use for original binary artifacts; never base64-encode files into prompts or patches.
+- `atlas_apply_patch`: apply a text patch. The server stages and validates the patch before writing; successful writes re-index by default.
+
+There is no separate public source-markdown write tool. Text source records
+should be written in the same patch as the related `knowledge/`, `_index.md`,
+`_state.md`, or `_log.md` updates so clients do not stop after storing raw
+material. For binary originals, use `atlas_upload_file` first, then create the
+source markdown record and knowledge updates in one `atlas_apply_patch` patch.
 
 ## Skill Resources And Prompts
 
@@ -138,10 +141,13 @@ ChatGPT / Claude / Codex
   -> MCP-served Atlas workflow prompt/resource
   -> qmd local retrieval
   -> Atlas frontmatter graph parsing
-  -> evidence, stale-context, and metacognition packaging
+  -> relation-based context packaging
 ```
 
-Use `atlas_index` after files change. Then use `atlas_search` for candidate memory, `atlas_trace` for graph context, and `atlas_propose_patch` before `atlas_apply_patch` for client-orchestrated writes.
+Use `atlas_search` for candidate memory, `atlas_context` for exact reads and
+project hydration, `atlas_trace` for graph context, `atlas_upload_file` for
+original binary artifacts, and `atlas_apply_patch` for client-orchestrated
+markdown writes.
 
 Example MCP `atlas_search` arguments:
 
@@ -167,7 +173,8 @@ Hybrid qmd search is available when you want it:
 }
 ```
 
-For vector/hybrid quality, run `atlas_index` with `embed: true` first. That may download local qmd models.
+For vector/hybrid quality, run the local server with `--index --embed` from the
+CLI before querying. That may download local qmd models.
 
 ## Claude Desktop
 
