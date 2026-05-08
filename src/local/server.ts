@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { createServer as createHttpServer, type IncomingMessage, type ServerResponse } from "node:http";
+import {
+	createServer as createHttpServer,
+	type IncomingMessage,
+	type ServerResponse,
+} from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -10,7 +14,6 @@ import {
 	addLineNumbers,
 	createStore,
 	extractSnippet,
-	type ExpandedQuery,
 	type HybridQueryResult,
 	type QMDStore,
 	type SearchResult,
@@ -18,33 +21,27 @@ import {
 import { z } from "zod";
 import {
 	atlasPathFromQmdDisplayPath,
+	type AtlasCoreRole,
 	LocalAtlasWorkspace,
 	type AtlasGraph,
 	type AtlasObject,
 } from "./workspace.js";
-import { ATLAS_SKILL_PROMPTS, AtlasSkillLibrary } from "./skill-library.js";
 
 const DEFAULT_PORT = 8787;
 const DEFAULT_COLLECTION = "atlas";
 
-type SearchMode = "lex" | "vector" | "hybrid";
-
 type SearchInput = {
-	query?: string;
-	searches?: ExpandedQuery[];
-	mode?: SearchMode;
-	limit?: number;
-	minScore?: number;
+	query: string;
+	client?: string;
+	project?: string;
 	intent?: string;
-	rerank?: boolean;
-	refreshIndex?: boolean;
+	limit?: number;
 };
 
 type RuntimeOptions = {
 	workspaceRoot?: string;
 	dbPath?: string;
 	collectionName?: string;
-	skillRoot?: string;
 };
 
 function jsonContent(value: unknown) {
@@ -53,17 +50,6 @@ function jsonContent(value: unknown) {
 			{
 				type: "text" as const,
 				text: JSON.stringify(value, null, 2),
-			},
-		],
-	};
-}
-
-function textContent(text: string) {
-	return {
-		content: [
-			{
-				type: "text" as const,
-				text,
 			},
 		],
 	};
@@ -93,7 +79,6 @@ function parseArgs(args: string[]) {
 		port: number;
 		workspaceRoot?: string;
 		dbPath?: string;
-		skillRoot?: string;
 		quiet: boolean;
 		embed: boolean;
 	} = {
@@ -146,11 +131,6 @@ function parseArgs(args: string[]) {
 			continue;
 		}
 
-		if (arg === "--skill-dir") {
-			result.skillRoot = args[++index];
-			continue;
-		}
-
 		throw new Error(`Unknown argument: ${arg}`);
 	}
 
@@ -159,26 +139,14 @@ function parseArgs(args: string[]) {
 
 function formatInstructions(runtime: LocalAtlasRuntime) {
 	return [
-		"Atlas Local MCP is a local company-brain orchestration server.",
+		"Atlas Local MCP provides and manages DAYONE company knowledge.",
 		`Workspace: ${runtime.workspace.root}`,
 		`QMD collection: ${runtime.collectionName}`,
 		"",
-		"Use `atlas_search` for refreshed retrieval, `atlas_context` for exact reads, and `atlas_trace` for frontmatter graph context.",
+		"Use the slim v0 Atlas tools: discovery, core file create/update, and knowledge read/create/update/delete.",
 		"Markdown files remain canonical. qmd is used only as the local retrieval index.",
-		"Atlas workflow docs are served as MCP resources under atlas://skill/... and as workflow prompts such as atlas_ingest_workflow.",
-		"Frontmatter is intentionally minimal: id, title, updated_at, optional owners, and optional relations (supersedes, supports, contradicts, depends_on, related_to). Lifecycle is derived from the graph and timestamps.",
+		"Frontmatter is intentionally minimal: id, title, updated_at, optional sources, and optional flat relation hints. Knowledge writes keep _index.md current.",
 	].join("\n");
-}
-
-function sourceQuery(input: SearchInput) {
-	if (input.query) {
-		return input.query;
-	}
-
-	return input.searches?.find((item) => item.type === "lex")?.query
-		?? input.searches?.find((item) => item.type === "vec")?.query
-		?? input.searches?.[0]?.query
-		?? "";
 }
 
 function objectSummary(object: AtlasObject | undefined) {
@@ -190,10 +158,45 @@ function objectSummary(object: AtlasObject | undefined) {
 		id: object.id ?? null,
 		type: object.type ?? null,
 		title: object.title,
-		owners: object.owners,
+		sources: object.sources,
 		updatedAt: object.updatedAt ?? null,
 		relationCount: object.relations.length,
 	};
+}
+
+function scopeFromPath(atlasPath: string) {
+	const match = atlasPath.match(/^clients\/([^/]+)(?:\/projects\/([^/]+))?/);
+
+	return {
+		client: match?.[1] ?? null,
+		project: match?.[2] ?? null,
+	};
+}
+
+function contextPathForObject(object: AtlasObject) {
+	if (/^clients\/[^/]+\/_client\.md$/.test(object.path)) {
+		return `/${path.posix.dirname(object.path)}`;
+	}
+
+	if (/^clients\/[^/]+\/projects\/[^/]+\/_project\.md$/.test(object.path)) {
+		return `/${path.posix.dirname(object.path)}`;
+	}
+
+	return `/${object.path}`;
+}
+
+function contextForObject(object: AtlasObject) {
+	const scope = scopeFromPath(object.path);
+	const parts = [
+		object.title,
+		object.type ? `Atlas ${object.type} page` : "Atlas markdown page",
+		scope.client ? `client: ${scope.client}` : undefined,
+		scope.project ? `project: ${scope.project}` : undefined,
+		object.sources.length > 0 ? `sources: ${object.sources.join(", ")}` : undefined,
+		object.relations.length > 0 ? `${object.relations.length} relation(s)` : undefined,
+	].filter(Boolean);
+
+	return parts.join(" | ");
 }
 
 function formatSearchResult(
@@ -205,10 +208,9 @@ function formatSearchResult(
 	const displayPath = result.displayPath;
 	const atlasPath = atlasPathFromQmdDisplayPath(displayPath, collectionName);
 	const object = graph.byPath.get(atlasPath);
+	const scope = scopeFromPath(atlasPath);
 	const body = "bestChunk" in result ? result.bestChunk : ((result as SearchResult).body ?? "");
-	const snippet = body
-		? extractSnippet(body, query, 450, undefined, undefined).snippet
-		: "";
+	const snippet = body ? extractSnippet(body, query, 450, undefined, undefined).snippet : "";
 
 	return {
 		docid: `#${result.docid}`,
@@ -216,6 +218,9 @@ function formatSearchResult(
 		qmdPath: displayPath,
 		title: result.title,
 		score: Math.round(result.score * 1000) / 1000,
+		client: scope.client,
+		project: scope.project,
+		kind: object?.type ?? null,
 		context: result.context,
 		snippet,
 		metadata: objectSummary(object),
@@ -226,15 +231,13 @@ export class LocalAtlasRuntime {
 	readonly workspace: LocalAtlasWorkspace;
 	readonly collectionName: string;
 	readonly dbPath: string;
-	readonly skillRoot?: string;
 	private storePromise?: Promise<QMDStore>;
-	private skillLibraryPromise?: Promise<AtlasSkillLibrary | undefined>;
 
 	constructor(options: RuntimeOptions = {}) {
 		this.workspace = LocalAtlasWorkspace.fromEnv(options.workspaceRoot);
-		this.collectionName = options.collectionName ?? process.env.ATLAS_QMD_COLLECTION ?? DEFAULT_COLLECTION;
+		this.collectionName =
+			options.collectionName ?? process.env.ATLAS_QMD_COLLECTION ?? DEFAULT_COLLECTION;
 		this.dbPath = this.workspace.dbPath(options.dbPath);
-		this.skillRoot = options.skillRoot;
 	}
 
 	async getStore() {
@@ -244,7 +247,7 @@ export class LocalAtlasRuntime {
 				dbPath: this.dbPath,
 				config: {
 					global_context:
-						"Atlas local markdown company brain. Frontmatter carries id, title, updated_at, owners, and a small set of relations.",
+						"Atlas local markdown knowledge workspace for DAYONE company knowledge. Frontmatter carries id, title, updated_at, optional sources, and optional flat relation hints.",
 					collections: {
 						[this.collectionName]: {
 							path: this.workspace.root,
@@ -258,13 +261,10 @@ export class LocalAtlasRuntime {
 								"dist/**",
 								"build/**",
 							],
-							context:
-								{
-									"/": "Atlas markdown memory workspace.",
-									"/clients": "Client and project-scoped Atlas memory.",
-									"/sources": "Source markdown records.",
-									"/knowledge": "Maintained knowledge objects.",
-								},
+							context: {
+								"/": "Atlas markdown memory workspace.",
+								"/clients": "Client and project-scoped Atlas knowledge.",
+							},
 						},
 					},
 				},
@@ -272,17 +272,6 @@ export class LocalAtlasRuntime {
 		}
 
 		return this.storePromise;
-	}
-
-	async getSkillLibrary() {
-		if (!this.skillLibraryPromise) {
-			this.skillLibraryPromise = AtlasSkillLibrary.discover({
-				workspaceRoot: this.workspace.root,
-				explicitRoot: this.skillRoot,
-			});
-		}
-
-		return this.skillLibraryPromise;
 	}
 
 	async close() {
@@ -295,8 +284,40 @@ export class LocalAtlasRuntime {
 		this.storePromise = undefined;
 	}
 
+	async syncQmdContexts(graph?: AtlasGraph) {
+		const store = await this.getStore();
+		const atlasGraph = graph ?? (await this.workspace.buildGraph());
+		const existingContexts = await store.listContexts();
+
+		await store.setGlobalContext(
+			"DAYONE company knowledge for clients, projects, evidence, decisions, commitments, risks, and live operating state.",
+		);
+
+		for (const context of existingContexts) {
+			if (context.collection === this.collectionName) {
+				await store.removeContext(this.collectionName, context.path);
+			}
+		}
+
+		await store.addContext(this.collectionName, "/", "DAYONE Atlas workspace root.");
+		await store.addContext(
+			this.collectionName,
+			"/clients",
+			"Client and project-scoped DAYONE Atlas knowledge.",
+		);
+
+		for (const object of atlasGraph.objects) {
+			await store.addContext(
+				this.collectionName,
+				contextPathForObject(object),
+				contextForObject(object),
+			);
+		}
+	}
+
 	async index(options?: { embed?: boolean; forceEmbed?: boolean }) {
 		const store = await this.getStore();
+		await this.syncQmdContexts();
 		const update = await store.update();
 		let embed;
 
@@ -317,14 +338,12 @@ export class LocalAtlasRuntime {
 		};
 	}
 
-	async status(options: { refreshIndex?: boolean } = {}) {
-		const refreshed = options.refreshIndex ? await this.index() : undefined;
+	async status() {
 		const store = await this.getStore();
-		const [qmd, graph, health, skillLibrary] = await Promise.all([
+		const [qmd, graph, health] = await Promise.all([
 			store.getStatus(),
 			this.workspace.buildGraph(),
 			this.workspace.healthCheck(),
-			this.getSkillLibrary(),
 		]);
 
 		return {
@@ -332,7 +351,6 @@ export class LocalAtlasRuntime {
 			workspaceRoot: this.workspace.root,
 			dbPath: this.dbPath,
 			collection: this.collectionName,
-			...(refreshed ? { refreshedIndex: refreshed.update } : {}),
 			qmd,
 			graph: graph.summary,
 			health: {
@@ -341,87 +359,109 @@ export class LocalAtlasRuntime {
 				errorCount: health.issues.filter((issue) => issue.severity === "error").length,
 				warningCount: health.issues.filter((issue) => issue.severity === "warning").length,
 			},
-			skill: skillLibrary
-				? {
-						root: skillLibrary.root,
-						resources: skillLibrary.resources.length,
-						prompts: ATLAS_SKILL_PROMPTS,
-					}
-				: null,
 		};
 	}
 
+	async embed() {
+		return this.index({ embed: true });
+	}
+
 	async search(input: SearchInput) {
-		const refreshed = input.refreshIndex === false ? undefined : await this.index();
+		const refreshed = await this.index();
 		const store = await this.getStore();
 		const graph = await this.workspace.buildGraph();
 		const limit = input.limit ?? 10;
-		const mode = input.mode ?? (input.searches ? "hybrid" : "lex");
-		const query = sourceQuery(input);
+		const query = input.query?.trim() ?? "";
+		const client = input.client ? this.workspace.clientSlug(input.client) : undefined;
+		const project = input.project ? this.workspace.projectSlug(input.project) : undefined;
+		const scopePrefix = client
+			? project
+				? `clients/${client}/projects/${project}/`
+				: `clients/${client}/`
+			: undefined;
+		const scopeIntent = [
+			input.intent?.trim(),
+			client ? `client ${client}` : undefined,
+			project ? `project ${project}` : undefined,
+		]
+			.filter(Boolean)
+			.join("; ");
 
-		if (!query && !input.searches) {
-			throw new Error("search requires either query or searches.");
+		if (!query) {
+			throw new Error("search requires query.");
 		}
 
-		const results =
-			mode === "lex"
-				? await store.searchLex(query, {
-						limit,
-						collection: this.collectionName,
-					})
-				: mode === "vector"
-					? await store.searchVector(query, {
-							limit,
-							collection: this.collectionName,
-						})
-					: await store.search({
-							...(input.searches ? { queries: input.searches } : { query }),
-							collections: [this.collectionName],
-							limit,
-							minScore: input.minScore ?? 0,
-							intent: input.intent,
-							rerank: input.rerank ?? false,
-							chunkStrategy: "regex",
-						});
+		const results = await store.search({
+			query,
+			...(scopeIntent ? { intent: scopeIntent } : {}),
+			collections: [this.collectionName],
+			limit: scopePrefix ? Math.max(limit * 3, 20) : limit,
+			rerank: true,
+			chunkStrategy: "regex",
+		});
+		const filteredResults = scopePrefix
+			? results.filter((result) =>
+					atlasPathFromQmdDisplayPath(result.displayPath, this.collectionName).startsWith(
+						scopePrefix,
+					),
+				)
+			: results;
 
 		return {
 			ok: true,
-			mode,
 			query,
+			...(input.intent ? { intent: input.intent } : {}),
+			scope: {
+				client: client ?? null,
+				project: project ?? null,
+			},
 			...(refreshed ? { refreshedIndex: refreshed.update } : {}),
-			results: results.map((result) => formatSearchResult(result, graph, this.collectionName, query)),
+			results: filteredResults
+				.slice(0, limit)
+				.map((result) => formatSearchResult(result, graph, this.collectionName, query)),
 			graphWarnings: graph.warnings,
 		};
 	}
 }
 
-function sourcePatchWarning(paths: string[]) {
-	const touchesSource = paths.some((workspacePath) => workspacePath.includes("/sources/"));
-	const touchesKnowledge = paths.some((workspacePath) => workspacePath.includes("/knowledge/"));
+const clientSchema = z.string().min(1);
+const projectSchema = z.string().min(1);
+const knowledgeKindSchema = z.enum([
+	"conversation",
+	"topic",
+	"decision",
+	"report",
+	"research",
+	"artifact",
+	"source",
+	"assumption",
+	"commitment",
+	"risk",
+	"product_gap",
+	"incident",
+	"strategy",
+	"fact",
+	"event",
+]);
+const coreRoleSchema = z.enum(["atlas", "client", "project", "state", "index"]);
 
-	if (!touchesSource || touchesKnowledge) {
-		return undefined;
-	}
+async function writeContent(
+	runtime: LocalAtlasRuntime,
+	operation: () => Promise<Record<string, unknown>>,
+) {
+	const result = await operation();
+	const index = await runtime.index();
+	const health = await runtime.workspace.healthCheck();
 
-	return {
-		severity: "warning" as const,
-		type: "source_without_knowledge_update",
-		message:
-			"Patch touches sources/ but no knowledge/ page. For source ingest, Atlas is incomplete until at least one knowledge page is created or updated.",
-	};
-}
-
-function sourceUploadWarning(workspacePath: string) {
-	if (!workspacePath.includes("/sources/")) {
-		return undefined;
-	}
-
-	return {
-		severity: "warning" as const,
-		type: "source_upload_requires_knowledge_update",
-		message:
-			"File uploaded under sources/. Source ingest is incomplete until a source markdown record and at least one knowledge page are created or updated.",
-	};
+	return jsonContent({
+		...result,
+		index: index.update,
+		health: {
+			ok: health.ok,
+			issueCount: health.issues.length,
+			issues: health.issues,
+		},
+	});
 }
 
 async function createMcpServer(runtime: LocalAtlasRuntime) {
@@ -435,92 +475,36 @@ async function createMcpServer(runtime: LocalAtlasRuntime) {
 		},
 	);
 
-	const skillLibrary = await runtime.getSkillLibrary();
-
-	if (skillLibrary) {
-		for (const resource of skillLibrary.resources) {
-			server.registerResource(
-				resource.name,
-				resource.uri,
-				{
-					title: resource.title,
-					description: `Atlas skill workflow document: ${resource.relativePath}`,
-					mimeType: resource.mimeType,
-					size: await skillLibrary.resourceSize(resource.relativePath),
-				},
-				async (uri) => ({
-					contents: [
-						{
-							uri: uri.toString(),
-							mimeType: resource.mimeType,
-							text: await skillLibrary.read(skillLibrary.resolveResourceUri(uri)),
-						},
-					],
-				}),
-			);
-		}
-
-		for (const promptName of ATLAS_SKILL_PROMPTS) {
-			server.registerPrompt(
-				promptName,
-				{
-					title: promptName.replace(/_/g, " ").replace(/\b\w/g, (value) => value.toUpperCase()),
-					description:
-						"Client-orchestrated Atlas workflow prompt served from the canonical Atlas skill.",
-					argsSchema: {
-						scope: z.string().optional(),
-					},
-				},
-				async ({ scope }) => ({
-					description:
-						"Follow this Atlas workflow using Atlas MCP as deterministic memory tooling.",
-					messages: [
-						{
-							role: "user",
-							content: {
-								type: "text",
-								text: await skillLibrary.readPrompt(promptName, scope),
-							},
-						},
-					],
-				}),
-			);
-		}
-	}
-
 	server.registerTool(
 		"atlas_status",
 		{
-			description:
-				"Show local Atlas workspace, qmd index, graph, health, and served skill status. Set refreshIndex=true after out-of-band file changes.",
-			inputSchema: {
-				refreshIndex: z.boolean().default(false),
-			},
+			description: "Show local Atlas workspace, qmd index, graph, and health status.",
+			inputSchema: {},
 		},
-		async ({ refreshIndex }) => jsonContent(await runtime.status({ refreshIndex })),
+		async () => jsonContent(await runtime.status()),
+	);
+
+	server.registerTool(
+		"atlas_embed",
+		{
+			description:
+				"Refresh the qmd index and generate missing local vector embeddings for Atlas search. Use manually after bulk or out-of-band markdown changes; suitable for future scheduled runs.",
+			inputSchema: {},
+		},
+		async () => jsonContent(await runtime.embed()),
 	);
 
 	server.registerTool(
 		"atlas_search",
 		{
 			description:
-				"Refresh and search Atlas markdown locally via qmd. Default mode is lex for fast BM25; use hybrid/vector after embeddings are available.",
+				"Refresh qmd context/index and query Atlas markdown via query expansion, hybrid retrieval, and reranking. Optional client/project scope and intent steer expansion and filter results.",
 			inputSchema: {
-				query: z.string().optional(),
-				searches: z
-					.array(
-						z.object({
-							type: z.enum(["lex", "vec", "hyde"]),
-							query: z.string().min(1),
-						}),
-					)
-					.optional(),
-				mode: z.enum(["lex", "vector", "hybrid"]).default("lex"),
+				query: z.string().min(1),
+				client: clientSchema.optional(),
+				project: projectSchema.optional(),
+				intent: z.string().min(1).optional(),
 				limit: z.number().int().min(1).max(50).default(10),
-				minScore: z.number().min(0).max(1).default(0),
-				intent: z.string().optional(),
-				rerank: z.boolean().default(false),
-				refreshIndex: z.boolean().default(true),
 			},
 		},
 		async (input) => jsonContent(await runtime.search(input)),
@@ -530,7 +514,7 @@ async function createMcpServer(runtime: LocalAtlasRuntime) {
 		"atlas_context",
 		{
 			description:
-				"Hydrate a project scope, read exact Atlas paths, or list a workspace directory. A singular path ending in .md is treated as an exact file read.",
+				"Read one project context, read exact Atlas paths, or list one workspace directory. Pass exactly one of path, paths, or listPath.",
 			inputSchema: {
 				path: z.string().optional(),
 				paths: z.array(z.string()).min(1).max(50).optional(),
@@ -538,7 +522,12 @@ async function createMcpServer(runtime: LocalAtlasRuntime) {
 			},
 		},
 		async ({ path: workspacePath, paths, listPath }) => {
-			if (workspacePath && !paths && !listPath) {
+			const modeCount = [workspacePath, paths, listPath].filter(Boolean).length;
+			if (modeCount !== 1) {
+				throw new Error("atlas_context requires exactly one of path, paths, or listPath.");
+			}
+
+			if (workspacePath) {
 				if (workspacePath.endsWith(".md")) {
 					return jsonContent({
 						ok: true,
@@ -549,21 +538,17 @@ async function createMcpServer(runtime: LocalAtlasRuntime) {
 				return jsonContent(await runtime.workspace.projectContext(workspacePath));
 			}
 
-			const result: Record<string, unknown> = {
-				ok: true,
-			};
-
-			if (workspacePath) {
-				result.project = await runtime.workspace.projectContext(workspacePath);
-			}
-
 			if (paths) {
-				result.files = await runtime.workspace.readMany(paths);
+				return jsonContent({
+					ok: true,
+					files: await runtime.workspace.readMany(paths),
+				});
 			}
 
-			result.listing = await runtime.workspace.list(listPath ?? "/");
-
-			return jsonContent(result);
+			return jsonContent({
+				ok: true,
+				listing: await runtime.workspace.list(listPath ?? "/"),
+			});
 		},
 	);
 
@@ -571,7 +556,7 @@ async function createMcpServer(runtime: LocalAtlasRuntime) {
 		"atlas_trace",
 		{
 			description:
-				"Trace Atlas frontmatter graph relations (supersedes, supports, contradicts, depends_on, related_to) and owners from an Atlas ID or markdown path.",
+				"Trace Atlas relation hints from flat frontmatter relations from an Atlas ID or markdown path.",
 			inputSchema: {
 				idOrPath: z.string().min(1),
 				depth: z.number().int().min(1).max(5).default(2),
@@ -584,60 +569,117 @@ async function createMcpServer(runtime: LocalAtlasRuntime) {
 		"atlas_health_check",
 		{
 			description:
-				"Lint local Atlas memory for broken relationships, frontmatter parse errors, and missing required fields (id, title, updated_at).",
+				"Lint local Atlas knowledge for broken relation hints, frontmatter parse errors, and missing required fields (id, title, updated_at).",
 			inputSchema: {},
 		},
 		async () => jsonContent(await runtime.workspace.healthCheck()),
 	);
 
 	server.registerTool(
-		"atlas_upload_file",
+		"atlas_knowledge_read",
 		{
-			description:
-				"Copy a local filesystem file directly into the Atlas workspace. localPath must be absolute. Use for original binary artifacts; do not base64-encode files in prompts or patches.",
-			inputSchema: {
-				localPath: z.string().min(1),
-				path: z.string().min(1),
-				overwrite: z.boolean().default(false),
-				indexAfterUpload: z.boolean().default(true),
-			},
+			description: "Read one Atlas knowledge page.",
+			inputSchema: z
+				.object({ client: clientSchema, project: projectSchema, slug: z.string().min(1) })
+				.strict(),
 		},
-		async ({ localPath, path: workspacePath, overwrite, indexAfterUpload }) => {
-			const upload = await runtime.workspace.uploadFile(localPath, workspacePath, { overwrite });
-			const index = indexAfterUpload ? await runtime.index() : undefined;
-			const warning = sourceUploadWarning(upload.path);
-
-			return jsonContent({
-				...upload,
-				...(index ? { index: index.update } : {}),
-				...(warning ? { warnings: [warning] } : {}),
-			});
-		},
+		async (input) => jsonContent(await runtime.workspace.getKnowledge(input)),
 	);
 
 	server.registerTool(
-		"atlas_apply_patch",
+		"atlas_knowledge_create",
 		{
-			description:
-				"Apply a text patch to local Atlas memory. The patch is staged and validated before files are written; successful writes re-index by default.",
+			description: "Create one Atlas knowledge page in a project root.",
 			inputSchema: z
 				.object({
-					input: z.string().min(1),
-					indexAfterWrite: z.boolean().default(true),
+					client: clientSchema,
+					project: projectSchema,
+					slug: z.string().min(1),
+					kind: knowledgeKindSchema,
+					title: z.string().min(1),
+					body: z.string().min(1),
+					sources: z.array(z.string().min(1)).optional(),
+					relations: z.array(z.string().min(1)).optional(),
 				})
 				.strict(),
 		},
-		async ({ input, indexAfterWrite }) => {
-			const patch = await runtime.workspace.applyTextPatch(input);
-			const index = indexAfterWrite ? await runtime.index() : undefined;
-			const warning = sourcePatchWarning(patch.touched);
+		async (input) => writeContent(runtime, () => runtime.workspace.createKnowledge(input)),
+	);
 
-			return jsonContent({
-				...patch,
-				...(index ? { index: index.update } : {}),
-				...(warning ? { warnings: [warning] } : {}),
-			});
+	server.registerTool(
+		"atlas_knowledge_update",
+		{
+			description: "Update one Atlas knowledge page.",
+			inputSchema: z
+				.object({
+					client: clientSchema,
+					project: projectSchema,
+					slug: z.string().min(1),
+					title: z.string().min(1).optional(),
+					body: z.string().optional(),
+					sources: z.array(z.string().min(1)).optional(),
+					relations: z.array(z.string().min(1)).optional(),
+				})
+				.strict(),
 		},
+		async (input) => writeContent(runtime, () => runtime.workspace.updateKnowledge(input)),
+	);
+
+	server.registerTool(
+		"atlas_knowledge_delete",
+		{
+			description: "Delete one Atlas knowledge page.",
+			inputSchema: z
+				.object({ client: clientSchema, project: projectSchema, slug: z.string().min(1) })
+				.strict(),
+		},
+		async (input) => writeContent(runtime, () => runtime.workspace.deleteKnowledge(input)),
+	);
+
+	server.registerTool(
+		"atlas_core_create",
+		{
+			description:
+				"Create a bounded Atlas core underscore file. Roles: atlas, client, project, state, index. Project role creates or repairs the full project scaffold.",
+			inputSchema: z
+				.object({
+					role: coreRoleSchema,
+					client: clientSchema.optional(),
+					project: projectSchema.optional(),
+					title: z.string().min(1).optional(),
+					body: z.string().optional(),
+					sources: z.array(z.string().min(1)).optional(),
+					relations: z.array(z.string().min(1)).optional(),
+				})
+				.strict(),
+		},
+		async (input) =>
+			writeContent(runtime, () =>
+				runtime.workspace.createCore({ ...input, role: input.role as AtlasCoreRole }),
+			),
+	);
+
+	server.registerTool(
+		"atlas_core_update",
+		{
+			description:
+				"Update a bounded Atlas core underscore file. Roles: atlas, client, project, state, index.",
+			inputSchema: z
+				.object({
+					role: coreRoleSchema,
+					client: clientSchema.optional(),
+					project: projectSchema.optional(),
+					title: z.string().min(1).optional(),
+					body: z.string().optional(),
+					sources: z.array(z.string().min(1)).optional(),
+					relations: z.array(z.string().min(1)).optional(),
+				})
+				.strict(),
+		},
+		async (input) =>
+			writeContent(runtime, () =>
+				runtime.workspace.updateCore({ ...input, role: input.role as AtlasCoreRole }),
+			),
 	);
 
 	return server;
@@ -727,7 +769,10 @@ export async function startHttp(
 				return;
 			}
 
-			if ((url.pathname === "/query" || url.pathname === "/search") && req.method === "POST") {
+			if (
+				(url.pathname === "/query" || url.pathname === "/search") &&
+				req.method === "POST"
+			) {
 				const rawBody = await collectBody(req);
 				const params = JSON.parse(rawBody) as SearchInput;
 				writeJson(res, 200, await runtime.search(params));
@@ -816,7 +861,10 @@ export async function startHttp(
 					return;
 				}
 
-				const rawBody = req.method !== "GET" && req.method !== "HEAD" ? await collectBody(req) : undefined;
+				const rawBody =
+					req.method !== "GET" && req.method !== "HEAD"
+						? await collectBody(req)
+						: undefined;
 				const request = new Request(`http://localhost:${port}${url.pathname}`, {
 					method: req.method ?? "GET",
 					headers,
@@ -879,7 +927,6 @@ async function main() {
 	const runtime = new LocalAtlasRuntime({
 		workspaceRoot: args.workspaceRoot,
 		dbPath: args.dbPath,
-		skillRoot: args.skillRoot,
 	});
 
 	if (args.mode === "stdio") {

@@ -1,16 +1,18 @@
 # Atlas MCP
 
-Local-first MCP server for testing Atlas company-brain orchestration.
+Local-first MCP server for providing and managing DAYONE company knowledge.
 
 The current development path is intentionally local:
 
-- markdown files on local disk are canonical memory
+- markdown files on local disk are canonical knowledge files
 - qmd provides the local retrieval index
-- Atlas parses minimal frontmatter (id, title, updated_at, owners, relations) for graph edges
-- Atlas MCP serves the canonical Atlas workflow docs as MCP resources and prompts
+- Atlas parses minimal frontmatter (id, title, updated_at, sources, relations) for provenance and relation hints
+- Atlas MCP exposes operational tools only; knowledge model guidance lives in the separate Atlas skill package
 - no Cloudflare Workers or R2 are required for behavior testing
 
-The old Worker/R2 implementation is still present in `src/index.ts` for later deployment work, but `npm run dev` now starts the local Node server.
+The old Worker/R2 implementation is still present as a read-only fallback in
+`src/index.ts` for later deployment work, but `npm run dev` now starts the local
+Node server.
 
 ## Requirements
 
@@ -18,7 +20,7 @@ The old Worker/R2 implementation is still present in `src/index.ts` for later de
 - npm
 - local markdown workspace
 
-`@tobilu/qmd` stores its SQLite index locally and can optionally download local GGUF models when vector embeddings or hybrid query expansion are used. The default Atlas search mode is lexical BM25, so the first local path does not require model downloads.
+`@tobilu/qmd` stores its SQLite index locally and can optionally download local GGUF models when embeddings, query expansion, or reranking are used. Atlas search uses qmd's best-quality local query path.
 
 ## Run Locally
 
@@ -63,13 +65,6 @@ You can override it:
 ATLAS_QMD_DB=/tmp/atlas-qmd.sqlite npm run dev
 ```
 
-Atlas MCP discovers the canonical skill docs from `../atlas-skill/skills/atlas`
-when running from this repo. Override that path when needed:
-
-```bash
-ATLAS_SKILL_DIR=/path/to/atlas/skills/atlas npm run dev
-```
-
 ## Scripts
 
 ```bash
@@ -77,6 +72,7 @@ npm run dev            # local HTTP MCP server on localhost:8787
 npm run local:http     # same as dev
 npm run local:stdio    # stdio MCP server for local clients
 npm run local:index    # index local markdown into qmd and exit
+npm run local:index:embed # index markdown and generate local vector embeddings
 npm run smoke:local    # end-to-end local MCP smoke test
 ```
 
@@ -88,93 +84,60 @@ npm run worker:dev:local
 npm run deploy
 ```
 
+The Worker fallback is intentionally read-only and only exposes
+`atlas_status` and `atlas_context`.
+
 ## Local MCP Tools
 
-Atlas intentionally exposes a small semantic tool surface:
+Atlas exposes a slim v0 tool surface. It does not expose raw workspace
+write, append, delete, patch, source, event, index, client CRUD, or project
+CRUD tools.
 
-- `atlas_status`: show workspace, qmd, graph, skill, and health status. Set `refreshIndex: true` after out-of-band file changes.
-- `atlas_search`: refresh and query markdown through qmd. Defaults to fast lexical BM25.
-- `atlas_context`: hydrate a project scope, read exact files with `paths`, or list a directory with `listPath`.
-- `atlas_trace`: trace frontmatter relations (supersedes, supports, contradicts, depends_on, related_to) and owners.
-- `atlas_health_check`: lint local memory for broken relationships, frontmatter parse errors, and missing required fields (id, title, updated_at).
-- `atlas_upload_file`: copy an absolute local filesystem path directly into the Atlas workspace. Use for original binary artifacts; never base64-encode files into prompts or patches.
-- `atlas_apply_patch`: apply a text patch. The server stages and validates the patch before writing; successful writes re-index by default.
+- Discovery: `atlas_status`, `atlas_embed`, `atlas_search`, `atlas_context`, `atlas_trace`, `atlas_health_check`
+- Core files: `atlas_core_create`, `atlas_core_update`
+- Knowledge: `atlas_knowledge_read`, `atlas_knowledge_create`, `atlas_knowledge_update`, `atlas_knowledge_delete`
 
-There is no separate public source-markdown write tool. Text source records
-should be written in the same patch as the related `knowledge/`, `_index.md`,
-`_state.md`, or `_log.md` updates so clients do not stop after storing raw
-material. For binary originals, use `atlas_upload_file` first, then create the
-source markdown record and knowledge updates in one `atlas_apply_patch` patch.
-
-## Skill Resources And Prompts
-
-Atlas MCP serves the canonical Atlas skill docs directly, so clients that support MCP resources/prompts can discover the workflow without a separate installed skill package.
-
-Resources:
-
-```text
-atlas://skill/SKILL.md
-atlas://skill/actions/ingest.md
-atlas://skill/actions/query.md
-atlas://skill/actions/lint.md
-atlas://skill/references/frontmatter.md
-atlas://skill/references/object-types.md
-```
-
-Prompts:
-
-```text
-atlas_ingest_workflow
-atlas_query_workflow
-atlas_lint_workflow
-atlas_memory_health_review
-atlas_decision_review
-```
-
-The separate installed skill directory should be treated as a generated compatibility artifact for clients that do not yet use MCP-served workflow docs well.
+Agents should compose these tools for real workflows. Core files cover
+`_atlas.md`, `_client.md`, `_project.md`, `_state.md`, and `_index.md`.
+Knowledge writes update `_index.md` automatically.
 
 ## Query Flow
 
 ```text
 ChatGPT / Claude / Codex
   -> Atlas MCP
-  -> MCP-served Atlas workflow prompt/resource
   -> qmd local retrieval
-  -> Atlas frontmatter graph parsing
-  -> relation-based context packaging
+  -> Atlas frontmatter parsing
+  -> relation hint packaging
 ```
 
-Use `atlas_search` for candidate memory, `atlas_context` for exact reads and
-project hydration, `atlas_trace` for graph context, `atlas_upload_file` for
-original binary artifacts, and `atlas_apply_patch` for client-orchestrated
-markdown writes.
+Use `atlas_embed` after bulk changes when vector coverage should be refreshed.
+Embedding also refreshes qmd path context from Atlas files. Use `atlas_search`
+for candidate knowledge pages, `atlas_context` for exact reads and project context, and
+`atlas_trace` for relation hints. Use `atlas_core_create/update` for
+underscore files and `atlas_knowledge_*` for project knowledge pages.
 
 Example MCP `atlas_search` arguments:
 
 ```json
 {
-  "query": "pricing packaging",
-  "mode": "lex",
-  "limit": 10
+	"query": "pricing packaging",
+	"client": "acme",
+	"project": "onboarding",
+	"intent": "Find pricing decision context",
+	"limit": 10
 }
 ```
 
-Hybrid qmd search is available when you want it:
+Generate embeddings before querying:
 
-```json
-{
-  "mode": "hybrid",
-  "searches": [
-    { "type": "lex", "query": "\"pricing packaging\"" },
-    { "type": "vec", "query": "why did pricing packaging matter?" }
-  ],
-  "rerank": false,
-  "limit": 10
-}
+```bash
+npm run local:index:embed
 ```
 
-For vector/hybrid quality, run the local server with `--index --embed` from the
-CLI before querying. That may download local qmd models.
+That may download local qmd GGUF models into `~/.cache/qmd/models/`. Atlas
+search uses qmd's local query expansion, BM25/vector retrieval, and reranking
+path.
 
 ## Claude Desktop
 
@@ -182,17 +145,16 @@ For stdio:
 
 ```json
 {
-  "mcpServers": {
-    "atlas": {
-      "command": "npm",
-      "args": ["run", "local:stdio"],
-      "cwd": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-mcp",
-      "env": {
-        "ATLAS_WORKSPACE": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-data",
-        "ATLAS_SKILL_DIR": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-skill/skills/atlas"
-      }
-    }
-  }
+	"mcpServers": {
+		"atlas": {
+			"command": "npm",
+			"args": ["run", "local:stdio"],
+			"cwd": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-mcp",
+			"env": {
+				"ATLAS_WORKSPACE": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-data"
+			}
+		}
+	}
 }
 ```
 

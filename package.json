@@ -9,6 +9,7 @@
 		"local:http": "tsx src/local/server.ts --http --port 8787 --workspace \"${ATLAS_WORKSPACE:-../atlas-data}\"",
 		"local:stdio": "tsx src/local/server.ts --stdio --workspace \"${ATLAS_WORKSPACE:-../atlas-data}\"",
 		"local:index": "tsx src/local/server.ts --index --workspace \"${ATLAS_WORKSPACE:-../atlas-data}\"",
+		"local:index:embed": "tsx src/local/server.ts --index --embed --workspace \"${ATLAS_WORKSPACE:-../atlas-data}\"",
 		"worker:dev": "wrangler dev",
 		"worker:dev:local": "wrangler dev -c wrangler.local.jsonc --persist-to .wrangler/local-state",
 		"smoke:local": "node scripts/smoke-local.mjs",
