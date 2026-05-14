@@ -1,28 +1,23 @@
 # Atlas MCP
 
-Local-first MCP server for providing and managing DAYONE company knowledge.
+MCP server for providing and managing DAYONE company knowledge.
 
-The current development path is intentionally local:
+Atlas is an online-first Worker MCP backed by Cloudflare:
 
-- markdown files on local disk are canonical knowledge files
-- qmd provides the local retrieval index
+- markdown files in R2 are canonical
+- Cloudflare AI Search provides retrieval
 - Atlas parses minimal frontmatter (id, title, updated_at, sources, relations) for provenance and relation hints
 - Atlas MCP exposes operational tools only; knowledge model guidance lives in the separate Atlas skill package
-- no Cloudflare Workers or R2 are required for behavior testing
 
-The old Worker/R2 implementation is still present as a read-only fallback in
-`src/index.ts` for later deployment work, but `npm run dev` now starts the local
-Node server.
+`npm run dev` starts the Worker dev server.
 
 ## Requirements
 
 - Node.js 22 or newer
 - npm
-- local markdown workspace
+- Cloudflare Wrangler access to the configured R2 bucket and AI Search instance
 
-`@tobilu/qmd` stores its SQLite index locally and can optionally download local GGUF models when embeddings, query expansion, or reranking are used. Atlas search uses qmd's best-quality local query path.
-
-## Run Locally
+## Run With Cloudflare AI Search
 
 From `atlas-mcp`:
 
@@ -31,67 +26,38 @@ npm install
 npm run dev
 ```
 
-By default, local scripts use the repo-level canonical workspace:
-
-```text
-/Users/Bean.Duong/Desktop/dev/atlas/atlas-data
-```
-
-Override it when needed:
-
-```bash
-ATLAS_WORKSPACE=/path/to/atlas-workspace npm run dev
-```
-
-The server starts at:
+The Worker dev server exposes the MCP endpoint at:
 
 ```text
 http://localhost:8787/mcp
 ```
 
-If `ATLAS_WORKSPACE` is omitted when using the npm scripts, `../atlas-data` is used.
-If you run `src/local/server.ts` directly without `--workspace` or `ATLAS_WORKSPACE`,
-the current working directory is used.
-
-Generated local state is stored under:
-
-```text
-$ATLAS_WORKSPACE/.atlas/qmd.sqlite
-```
-
-You can override it:
-
-```bash
-ATLAS_QMD_DB=/tmp/atlas-qmd.sqlite npm run dev
-```
+The Worker uses R2 and Cloudflare AI Search bindings from `wrangler.jsonc`.
+The current Cloudflare setup uses AI Search instance `small-paper-dfed`,
+backed by `atlas-bucket`.
 
 ## Scripts
 
 ```bash
-npm run dev            # local HTTP MCP server on localhost:8787
-npm run local:http     # same as dev
-npm run local:stdio    # stdio MCP server for local clients
-npm run local:index    # index local markdown into qmd and exit
-npm run local:index:embed # index markdown and generate local vector embeddings
-npm run smoke:local    # end-to-end local MCP smoke test
+npm run dev            # Cloudflare Worker dev server on localhost:8787
+npm run worker:dev     # same as dev
+npm run start          # same as dev
+npm run deploy
 ```
-
-Worker scripts are explicit:
+Create the MCP API key secret before deploying:
 
 ```bash
-npm run worker:dev
-npm run worker:dev:local
+wrangler secret put MCP_API_KEY
 npm run deploy
 ```
 
-The Worker fallback is intentionally read-only and only exposes
-`atlas_status` and `atlas_context`.
+R2-backed AI Search syncs on Cloudflare's managed schedule. Use Cloudflare AI
+Search controls when a manual sync is needed after writes.
 
-## Local MCP Tools
+## MCP Tools
 
-Atlas exposes a slim v0 tool surface. It does not expose raw workspace
-write, append, delete, patch, source, event, index, client CRUD, or project
-CRUD tools.
+Atlas exposes a slim tool surface. It does not expose raw workspace write,
+append, delete, patch, source, event, index, client CRUD, or project CRUD tools.
 
 - Discovery: `atlas_status`, `atlas_embed`, `atlas_search`, `atlas_context`, `atlas_trace`, `atlas_health_check`
 - Core files: `atlas_core_create`, `atlas_core_update`
@@ -105,17 +71,18 @@ Knowledge writes update `_index.md` automatically.
 
 ```text
 ChatGPT / Claude / Codex
-  -> Atlas MCP
-  -> qmd local retrieval
+  -> Atlas MCP Worker
+  -> R2 canonical markdown
+  -> Cloudflare AI Search retrieval
   -> Atlas frontmatter parsing
   -> relation hint packaging
 ```
 
-Use `atlas_embed` after bulk changes when vector coverage should be refreshed.
-Embedding also refreshes qmd path context from Atlas files. Use `atlas_search`
-for candidate knowledge pages, `atlas_context` for exact reads and project context, and
-`atlas_trace` for relation hints. Use `atlas_core_create/update` for
-underscore files and `atlas_knowledge_*` for project knowledge pages.
+R2-backed AI Search syncs on Cloudflare's managed schedule. `atlas_embed`
+reports Cloudflare AI Search indexing status. Use `atlas_search` for candidate
+knowledge pages, `atlas_context` for exact reads and project context, and
+`atlas_trace` for relation hints. Use `atlas_core_create/update` for underscore
+files and `atlas_knowledge_*` for project knowledge pages.
 
 Example MCP `atlas_search` arguments:
 
@@ -126,35 +93,6 @@ Example MCP `atlas_search` arguments:
 	"project": "onboarding",
 	"intent": "Find pricing decision context",
 	"limit": 10
-}
-```
-
-Generate embeddings before querying:
-
-```bash
-npm run local:index:embed
-```
-
-That may download local qmd GGUF models into `~/.cache/qmd/models/`. Atlas
-search uses qmd's local query expansion, BM25/vector retrieval, and reranking
-path.
-
-## Claude Desktop
-
-For stdio:
-
-```json
-{
-	"mcpServers": {
-		"atlas": {
-			"command": "npm",
-			"args": ["run", "local:stdio"],
-			"cwd": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-mcp",
-			"env": {
-				"ATLAS_WORKSPACE": "/Users/Bean.Duong/Desktop/dev/atlas/atlas-data"
-			}
-		}
-	}
 }
 ```
 
