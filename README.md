@@ -38,8 +38,7 @@ backed by `atlas-bucket`.
 
 Live graph access events are controlled by `ATLAS_ACCESS_EVENTS_ENABLED` in
 `wrangler.jsonc`. When enabled, MCP search/read/context tools publish accessed
-markdown paths to `/access/events` and `/access/ws` through the
-`AtlasAccessHub` Durable Object.
+markdown paths to `/access/events` through the `AtlasAccessHub` Durable Object.
 Set `ATLAS_ACCESS_EVENTS_TOKEN` as a secret if the browser subscription should
 use a separate read token.
 

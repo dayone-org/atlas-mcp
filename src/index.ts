@@ -240,52 +240,16 @@ export class AtlasAccessHub {
 			});
 		}
 
-		if (url.pathname === "/ws" && request.method === "GET") {
-			if (!accessEventsEnabled(this.env)) {
-				return new Response("Atlas access events are disabled.", { status: 404 });
-			}
-
-			const upgrade = request.headers.get("Upgrade");
-			if (upgrade !== "websocket") {
-				return new Response("Expected WebSocket upgrade.", { status: 426 });
-			}
-
-			const pair = new WebSocketPair();
-			const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
-			this.state.acceptWebSocket(server);
-			server.send(JSON.stringify({
-				type: "atlas_access_ready",
-				enabled: true,
-				timestamp: nowIso(),
-			}));
-
-			return new Response(null, { status: 101, webSocket: client });
-		}
-
 		return new Response("Not found", { status: 404 });
-	}
-
-	webSocketMessage(ws: WebSocket) {
-		ws.send(JSON.stringify({ type: "atlas_access_pong", timestamp: nowIso() }));
 	}
 
 	private encodeSse(event: string, data: unknown) {
 		return this.textEncoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 	}
 
-		private broadcast(message: unknown) {
-			const payload = JSON.stringify(message);
-
-		for (const socket of this.state.getWebSockets()) {
-			try {
-				socket.send(payload);
-			} catch {
-				socket.close(1011, "Failed to send Atlas access event.");
-			}
-			}
-
-			const ssePayload = this.encodeSse("atlas_access", message);
-			for (const [clientId, writer] of this.sseClients) {
+	private broadcast(message: unknown) {
+		const ssePayload = this.encodeSse("atlas_access", message);
+		for (const [clientId, writer] of this.sseClients) {
 				writer.write(ssePayload).catch(() => {
 					this.sseClients.delete(clientId);
 					writer.close().catch(() => {});
@@ -2243,7 +2207,7 @@ class CloudAtlasRuntime {
 			},
 			accessEvents: {
 				enabled: accessEventsEnabled(this.env),
-				transport: "durable-object-websocket",
+				transport: "durable-object-sse",
 			},
 			graph: graph.summary,
 			health: {
@@ -2729,15 +2693,6 @@ export default {
 
 			const runtime = new CloudAtlasRuntime(env);
 			return Response.json(await runtime.status());
-		}
-
-		if (url.pathname === "/access/ws" && request.method === "GET") {
-			if (!isAuthorizedAccessEventRequest(request, env)) {
-				return new Response("Unauthorized", { status: 401 });
-			}
-
-			const hubUrl = new URL("/ws", request.url);
-			return accessHub(env).fetch(new Request(hubUrl, request));
 		}
 
 		if (url.pathname === "/access/events" && request.method === "GET") {
