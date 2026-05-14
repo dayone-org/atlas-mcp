@@ -204,11 +204,11 @@ export class AtlasAccessHub {
 	async fetch(request: Request) {
 		const url = new URL(request.url);
 
-		if (url.pathname === "/record" && request.method === "POST") {
-			const event = await request.json() as AtlasAccessEvent;
-			await this.broadcast({ type: "atlas_access", event });
-			return Response.json({ ok: true });
-		}
+			if (url.pathname === "/record" && request.method === "POST") {
+				const event = await request.json() as AtlasAccessEvent;
+				this.broadcast({ type: "atlas_access", event });
+				return Response.json({ ok: true });
+			}
 
 		if (url.pathname === "/sse" && request.method === "GET") {
 			if (!accessEventsEnabled(this.env)) {
@@ -273,8 +273,8 @@ export class AtlasAccessHub {
 		return this.textEncoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 	}
 
-	private async broadcast(message: unknown) {
-		const payload = JSON.stringify(message);
+		private broadcast(message: unknown) {
+			const payload = JSON.stringify(message);
 
 		for (const socket of this.state.getWebSockets()) {
 			try {
@@ -282,19 +282,17 @@ export class AtlasAccessHub {
 			} catch {
 				socket.close(1011, "Failed to send Atlas access event.");
 			}
-		}
-
-		const ssePayload = this.encodeSse("atlas_access", message);
-		await Promise.all([...this.sseClients].map(async ([clientId, writer]) => {
-			try {
-				await writer.write(ssePayload);
-			} catch {
-				this.sseClients.delete(clientId);
-				writer.close().catch(() => {});
 			}
-		}));
+
+			const ssePayload = this.encodeSse("atlas_access", message);
+			for (const [clientId, writer] of this.sseClients) {
+				writer.write(ssePayload).catch(() => {
+					this.sseClients.delete(clientId);
+					writer.close().catch(() => {});
+				});
+			}
+		}
 	}
-}
 
 function hasControlCharacter(value: string) {
 	for (let index = 0; index < value.length; index++) {
