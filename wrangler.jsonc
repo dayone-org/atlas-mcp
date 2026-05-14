@@ -11,9 +11,26 @@
 	"observability": {
 		"enabled": true,
 	},
+	"vars": {
+		"ATLAS_ACCESS_EVENTS_ENABLED": "true",
+	},
 	"assets": {
 		"directory": "./public",
 	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "ATLAS_ACCESS_HUB",
+				"class_name": "AtlasAccessHub",
+			},
+		],
+	},
+	"migrations": [
+		{
+			"tag": "v1_atlas_access_hub",
+			"new_sqlite_classes": ["AtlasAccessHub"],
+		},
+	],
 	"r2_buckets": [
 		{
 			"binding": "ATLAS_BUCKET",

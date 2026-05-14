@@ -36,6 +36,13 @@ The Worker uses R2 and Cloudflare AI Search bindings from `wrangler.jsonc`.
 The current Cloudflare setup uses AI Search instance `small-paper-dfed`,
 backed by `atlas-bucket`.
 
+Live graph access events are controlled by `ATLAS_ACCESS_EVENTS_ENABLED` in
+`wrangler.jsonc`. When enabled, MCP search/read/context tools publish accessed
+markdown paths to `/access/events` and `/access/ws` through the
+`AtlasAccessHub` Durable Object.
+Set `ATLAS_ACCESS_EVENTS_TOKEN` as a secret if the browser subscription should
+use a separate read token.
+
 ## Scripts
 
 ```bash
@@ -48,6 +55,8 @@ Create the MCP API key secret before deploying:
 
 ```bash
 wrangler secret put MCP_API_KEY
+# Optional read token for atlas-app graph subscriptions:
+wrangler secret put ATLAS_ACCESS_EVENTS_TOKEN
 npm run deploy
 ```
 

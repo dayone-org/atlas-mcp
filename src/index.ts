@@ -95,6 +95,19 @@ type AtlasFrontmatterInput = {
 	relations?: string[];
 };
 
+type AtlasAccessEvent = {
+	path: string;
+	nodeId: string;
+	source: string;
+	timestamp: string;
+};
+
+type AtlasWorkerEnv = Env & {
+	ATLAS_ACCESS_EVENTS_ENABLED?: string;
+	ATLAS_ACCESS_EVENTS_TOKEN?: string;
+	ATLAS_ACCESS_HUB: DurableObjectNamespace;
+};
+
 function jsonContent(value: unknown) {
 	return {
 		content: [
@@ -110,6 +123,65 @@ function errorMessage(error: unknown) {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function atlasNodeIdForPath(path: string) {
+	return `atlas/${normalizeFilePath(path)}`;
+}
+
+function accessEventsEnabled(env: Env) {
+	return (env as AtlasWorkerEnv).ATLAS_ACCESS_EVENTS_ENABLED === "true";
+}
+
+function accessEventsToken(env: Env) {
+	return (env as AtlasWorkerEnv).ATLAS_ACCESS_EVENTS_TOKEN?.trim();
+}
+
+function accessHub(env: Env) {
+	return (env as AtlasWorkerEnv).ATLAS_ACCESS_HUB.getByName("global");
+}
+
+function isAuthorizedAccessEventRequest(request: Request, env: Env) {
+	const configuredToken = accessEventsToken(env);
+	const url = new URL(request.url);
+	const queryToken = url.searchParams.get("access_token")?.trim();
+
+	if (configuredToken && queryToken === configuredToken) {
+		return true;
+	}
+
+	if (apiKeyIsConfigured(env) && requireApiKey(request, env)) {
+		return true;
+	}
+
+	return !configuredToken && !apiKeyIsConfigured(env);
+}
+
+async function maybeEmitAccess(env: Env, path: string, source: string) {
+	if (!accessEventsEnabled(env)) return;
+
+	try {
+		const normalizedPath = normalizeFilePath(path);
+		const event: AtlasAccessEvent = {
+			path: normalizedPath,
+			nodeId: atlasNodeIdForPath(normalizedPath),
+			source,
+			timestamp: nowIso(),
+		};
+
+		await accessHub(env).fetch("https://atlas-access-hub.local/record", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(event),
+		});
+	} catch (error) {
+		console.warn("Failed to emit Atlas access event", error);
+	}
+}
+
+async function maybeEmitManyAccesses(env: Env, paths: string[], source: string) {
+	const uniquePaths = [...new Set(paths.filter((path) => path.endsWith(".md")))];
+	await Promise.all(uniquePaths.map((path) => maybeEmitAccess(env, path, source)));
+}
+
 function getAiSearch(env: Env) {
 	const binding = (env as Env & { ATLAS_SEARCH?: AiSearchInstanceBinding }).ATLAS_SEARCH;
 
@@ -118,6 +190,110 @@ function getAiSearch(env: Env) {
 	}
 
 	return binding;
+}
+
+export class AtlasAccessHub {
+	private readonly sseClients = new Map<string, WritableStreamDefaultWriter<Uint8Array>>();
+	private readonly textEncoder = new TextEncoder();
+
+	constructor(
+		private readonly state: DurableObjectState,
+		private readonly env: AtlasWorkerEnv,
+	) {}
+
+	async fetch(request: Request) {
+		const url = new URL(request.url);
+
+		if (url.pathname === "/record" && request.method === "POST") {
+			const event = await request.json() as AtlasAccessEvent;
+			await this.broadcast({ type: "atlas_access", event });
+			return Response.json({ ok: true });
+		}
+
+		if (url.pathname === "/sse" && request.method === "GET") {
+			if (!accessEventsEnabled(this.env)) {
+				return new Response("Atlas access events are disabled.", { status: 404 });
+			}
+
+			const clientId = crypto.randomUUID();
+			const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+			const writer = writable.getWriter();
+			this.sseClients.set(clientId, writer);
+			writer.write(this.encodeSse("atlas_access_ready", {
+				enabled: true,
+				timestamp: nowIso(),
+			})).catch(() => {
+				this.sseClients.delete(clientId);
+			});
+
+			request.signal.addEventListener("abort", () => {
+				this.sseClients.delete(clientId);
+				writer.close().catch(() => {});
+			});
+
+			return new Response(readable, {
+				headers: {
+					"content-type": "text/event-stream; charset=utf-8",
+					"cache-control": "no-cache, no-transform",
+					"connection": "keep-alive",
+				},
+			});
+		}
+
+		if (url.pathname === "/ws" && request.method === "GET") {
+			if (!accessEventsEnabled(this.env)) {
+				return new Response("Atlas access events are disabled.", { status: 404 });
+			}
+
+			const upgrade = request.headers.get("Upgrade");
+			if (upgrade !== "websocket") {
+				return new Response("Expected WebSocket upgrade.", { status: 426 });
+			}
+
+			const pair = new WebSocketPair();
+			const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+			this.state.acceptWebSocket(server);
+			server.send(JSON.stringify({
+				type: "atlas_access_ready",
+				enabled: true,
+				timestamp: nowIso(),
+			}));
+
+			return new Response(null, { status: 101, webSocket: client });
+		}
+
+		return new Response("Not found", { status: 404 });
+	}
+
+	webSocketMessage(ws: WebSocket) {
+		ws.send(JSON.stringify({ type: "atlas_access_pong", timestamp: nowIso() }));
+	}
+
+	private encodeSse(event: string, data: unknown) {
+		return this.textEncoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+	}
+
+	private async broadcast(message: unknown) {
+		const payload = JSON.stringify(message);
+
+		for (const socket of this.state.getWebSockets()) {
+			try {
+				socket.send(payload);
+			} catch {
+				socket.close(1011, "Failed to send Atlas access event.");
+			}
+		}
+
+		const ssePayload = this.encodeSse("atlas_access", message);
+		await Promise.all([...this.sseClients].map(async ([clientId, writer]) => {
+			try {
+				await writer.write(ssePayload);
+			} catch {
+				this.sseClients.delete(clientId);
+				writer.close().catch(() => {});
+			}
+		}));
+	}
 }
 
 function hasControlCharacter(value: string) {
@@ -2067,6 +2243,10 @@ class CloudAtlasRuntime {
 				info: aiSearchInfo,
 				stats: aiSearchStats,
 			},
+			accessEvents: {
+				enabled: accessEventsEnabled(this.env),
+				transport: "durable-object-websocket",
+			},
 			graph: graph.summary,
 			health: {
 				ok: health.ok,
@@ -2215,6 +2395,33 @@ async function writeContent(
 	});
 }
 
+async function writeContentWithAccessEvents(
+	runtime: CloudAtlasRuntime,
+	env: Env,
+	source: string,
+	operation: () => Promise<Record<string, unknown>>,
+) {
+	const result = await operation();
+	const changedPaths = Array.isArray(result.changedPaths)
+		? result.changedPaths.filter((path): path is string => typeof path === "string")
+		: [];
+	await maybeEmitManyAccesses(env, changedPaths, source);
+	const health = await runtime.workspace.healthCheck();
+
+	return jsonContent({
+		...result,
+		searchIndex: {
+			provider: "cloudflare-ai-search",
+			mode: "managed-r2-sync",
+		},
+		health: {
+			ok: health.ok,
+			issueCount: health.issues.length,
+			issues: health.issues,
+		},
+	});
+}
+
 function createServer(env: Env, origin: string) {
 	const runtime = new CloudAtlasRuntime(env);
 	const server = new McpServer(
@@ -2274,7 +2481,15 @@ function createServer(env: Env, origin: string) {
 				limit: z.number().int().min(1).max(50).default(10),
 			},
 		},
-		async (input) => jsonContent(await runtime.search(input)),
+		async (input) => {
+			const result = await runtime.search(input);
+			await maybeEmitManyAccesses(
+				env,
+				result.results.map((item) => item.path),
+				"atlas_search",
+			);
+			return jsonContent(result);
+		},
 	);
 
 	server.registerTool(
@@ -2298,19 +2513,37 @@ function createServer(env: Env, origin: string) {
 
 			if (path) {
 				if (path.endsWith(".md")) {
+					const files = await runtime.workspace.readMany([path]);
+					await maybeEmitManyAccesses(
+						env,
+						files.filter((file) => file.ok).map((file) => file.path),
+						"atlas_context",
+					);
 					return jsonContent({
 						ok: true,
-						files: await runtime.workspace.readMany([path]),
+						files,
 					});
 				}
 
-				return jsonContent(await runtime.workspace.projectContext(path));
+				const result = await runtime.workspace.projectContext(path);
+				await maybeEmitManyAccesses(
+					env,
+					result.coreFiles.filter((file) => file.ok).map((file) => file.path),
+					"atlas_context",
+				);
+				return jsonContent(result);
 			}
 
 			if (paths) {
+				const files = await runtime.workspace.readMany(paths);
+				await maybeEmitManyAccesses(
+					env,
+					files.filter((file) => file.ok).map((file) => file.path),
+					"atlas_context",
+				);
 				return jsonContent({
 					ok: true,
-					files: await runtime.workspace.readMany(paths),
+					files,
 				});
 			}
 
@@ -2355,7 +2588,11 @@ function createServer(env: Env, origin: string) {
 				.object({ client: clientSchema, project: projectSchema, slug: z.string().min(1) })
 				.strict(),
 		},
-		async (input) => jsonContent(await runtime.workspace.getKnowledge(input)),
+		async (input) => {
+			const result = await runtime.workspace.getKnowledge(input);
+			await maybeEmitAccess(env, result.path, "atlas_knowledge_read");
+			return jsonContent(result);
+		},
 	);
 
 	server.registerTool(
@@ -2376,7 +2613,13 @@ function createServer(env: Env, origin: string) {
 				})
 				.strict(),
 		},
-		async (input) => writeContent(runtime, () => runtime.workspace.createKnowledge(input)),
+		async (input) =>
+			writeContentWithAccessEvents(
+				runtime,
+				env,
+				"atlas_knowledge_create",
+				() => runtime.workspace.createKnowledge(input),
+			),
 	);
 
 	server.registerTool(
@@ -2396,7 +2639,13 @@ function createServer(env: Env, origin: string) {
 				})
 				.strict(),
 		},
-		async (input) => writeContent(runtime, () => runtime.workspace.updateKnowledge(input)),
+		async (input) =>
+			writeContentWithAccessEvents(
+				runtime,
+				env,
+				"atlas_knowledge_update",
+				() => runtime.workspace.updateKnowledge(input),
+			),
 	);
 
 	server.registerTool(
@@ -2430,7 +2679,7 @@ function createServer(env: Env, origin: string) {
 				.strict(),
 		},
 		async (input) =>
-			writeContent(runtime, () =>
+			writeContentWithAccessEvents(runtime, env, "atlas_core_create", () =>
 				runtime.workspace.createCore({ ...input, role: input.role as AtlasCoreRole }),
 			),
 	);
@@ -2454,7 +2703,7 @@ function createServer(env: Env, origin: string) {
 				.strict(),
 		},
 		async (input) =>
-			writeContent(runtime, () =>
+			writeContentWithAccessEvents(runtime, env, "atlas_core_update", () =>
 				runtime.workspace.updateCore({ ...input, role: input.role as AtlasCoreRole }),
 			),
 	);
@@ -2484,6 +2733,24 @@ export default {
 			return Response.json(await runtime.status());
 		}
 
+		if (url.pathname === "/access/ws" && request.method === "GET") {
+			if (!isAuthorizedAccessEventRequest(request, env)) {
+				return new Response("Unauthorized", { status: 401 });
+			}
+
+			const hubUrl = new URL("/ws", request.url);
+			return accessHub(env).fetch(new Request(hubUrl, request));
+		}
+
+		if (url.pathname === "/access/events" && request.method === "GET") {
+			if (!isAuthorizedAccessEventRequest(request, env)) {
+				return new Response("Unauthorized", { status: 401 });
+			}
+
+			const hubUrl = new URL("/sse", request.url);
+			return accessHub(env).fetch(new Request(hubUrl, request));
+		}
+
 		if (url.pathname === "/mcp") {
 			if (!requireApiKey(request, env)) {
 				return new Response("Unauthorized", { status: 401 });
@@ -2495,4 +2762,4 @@ export default {
 
 		return new Response("Not found", { status: 404 });
 	},
-} satisfies ExportedHandler<Env>;
+} satisfies ExportedHandler<AtlasWorkerEnv>;
